@@ -26,8 +26,28 @@ MIN_PDVS_PER_ROUTE = 15
 ON_SPECIALIZED_TARGET = 0.90
 ON_SPECIALIZED_ROUTE_MIN = 30
 ON_SPECIALIZED_ROUTE_ACTIVE_MIN = 10
-ON_SPECIALIZED_ROUTE_MAX = 35
+ON_SPECIALIZED_ROUTE_MAX = 30
 ON_NON_SPECIALIZED_ROUTE_MIN = 4
+
+# Cuotas ON operativas confirmadas por Planeación. Son valores exactos: el
+# aumento de la muestra mensual se asigna a OFF y nunca recalcula estas cuotas.
+ON_CITY_QUOTAS = {
+    "AREQUIPA": 65,
+    "CHICLAYO": 50,
+    "ICA": 50,
+    "IQUITOS": 50,
+    "LIMA": 635,
+    "TRUJILLO": 160,
+    "HUARAZ": 25,
+    "PIURA": 50,
+    "HUANCAYO": 50,
+    "HUACHO": 25,
+    "AYACUCHO": 25,
+    "TARAPOTO": 25,
+    "CUSCO": 50,
+    "TACNA": 25,
+}
+ON_FIXED_TOTAL = sum(ON_CITY_QUOTAS.values())
 
 # The August input has the Esparta field empty.  These are the Esparta cities
 # documented in the original selection procedure; a populated Esparta flag is

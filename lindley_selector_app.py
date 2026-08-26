@@ -15,9 +15,7 @@ import selector_engine
 OUTPUT_NAME = "SELECCION_MUESTRA_LINDLEY_AGOSTO_CORREGIDA.xlsx"
 SUPERVISION_NAME = "ARCHIVO_DEF_SUP_AGOSTO_CORREGIDO.xlsx"
 INCREASE_SCOPE_OPTIONS = {
-    "Solo OFF": "OFF",
-    "Solo ON": "ON",
-    "Ambos canales": "AMBOS",
+    "Solo OFF (ON fijo en 1.285)": "OFF",
 }
 
 
@@ -33,7 +31,7 @@ class SelectorApp(tk.Tk):
             "output": tk.StringVar(),
         }
         self.sample_size = tk.StringVar()
-        self.increase_scope = tk.StringVar(value="Solo OFF")
+        self.increase_scope = tk.StringVar(value="Solo OFF (ON fijo en 1.285)")
         self.requested_sample_size = 0
         self.increase_scope_code = "OFF"
         self.status = tk.StringVar(value="Selecciona los archivos y la carpeta de salida.")
@@ -71,7 +69,7 @@ class SelectorApp(tk.Tk):
         ).grid(row=11, column=0, sticky="w")
         ttk.Label(
             frame,
-            text="Cada ciudad conserva su cuota; sin universo queda en 0.",
+            text="Las cuotas ON son fijas por ciudad y suman 1.285.",
         ).grid(row=11, column=1, sticky="e")
 
         self.run_button = ttk.Button(frame, text="Generar selección", command=self._start)

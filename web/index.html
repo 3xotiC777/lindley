@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Genera la selección mensual de Lindley en el navegador con el mismo motor de la aplicación de escritorio."
+    />
+    <meta name="theme-color" content="#f4f0e8" />
+    <title>Selección Lindley</title>
+    <link rel="stylesheet" href="./styles.css" />
+</head>
+  <body>
+    <a class="skip-link" href="#selector-form">Ir al formulario</a>
+
+    <main class="page-shell">
+      <header class="hero" aria-labelledby="page-title">
+        <div class="brand-mark" aria-hidden="true">
+          <span>DN</span>
+        </div>
+        <div class="hero-copy">
+          <p class="eyebrow">Dichter &amp; Neira · Planeación regional</p>
+          <h1 id="page-title">Selección Lindley</h1>
+          <p class="hero-description">
+            Carga los tres archivos del mes, define la muestra y genera la selección sin instalar
+            ningún programa.
+          </p>
+        </div>
+        <div class="privacy-badge" title="El procesamiento ocurre dentro de este navegador">
+          <span class="privacy-dot" aria-hidden="true"></span>
+          Procesamiento local
+        </div>
+      </header>
+
+      <section class="privacy-note" aria-label="Privacidad de los archivos">
+        <span class="privacy-icon" aria-hidden="true">✓</span>
+        <div>
+          <strong>Tus archivos no se suben al sitio.</strong>
+          <span>El cálculo se ejecuta en este navegador y se borra al cerrar la pestaña.</span>
+        </div>
+      </section>
+
+      <section class="workspace" aria-labelledby="form-title">
+        <div class="section-heading">
+          <div>
+            <p class="step-label">Configuración</p>
+            <h2 id="form-title">Prepara la selección</h2>
+          </div>
+          <p class="section-hint">Los campos marcados con <span aria-hidden="true">*</span> son obligatorios.</p>
+        </div>
+
+        <form id="selector-form" novalidate>
+          <fieldset class="file-grid">
+            <legend class="sr-only">Archivos de entrada</legend>
+
+            <label class="file-card" for="preselection-file" data-file-card="preselection">
+              <span class="file-order">01</span>
+              <span class="file-body">
+                <span class="file-title">Preselección actual <span aria-hidden="true">*</span></span>
+                <span class="file-help">Universo .xlsx; la ciudad se toma de la columna NOMBRE</span>
+                <span class="file-name" data-file-name="preselection">Seleccionar archivo</span>
+              </span>
+              <span class="file-action" aria-hidden="true">Examinar</span>
+              <input
+                id="preselection-file"
+                name="preselection"
+                type="file"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                required
+              />
+            </label>
+
+            <label class="file-card" for="previous-file" data-file-card="previous">
+              <span class="file-order">02</span>
+              <span class="file-body">
+                <span class="file-title">Selección del mes anterior <span aria-hidden="true">*</span></span>
+                <span class="file-help">Archivo .xlsx o .xlsb</span>
+                <span class="file-name" data-file-name="previous">Seleccionar archivo</span>
+              </span>
+              <span class="file-action" aria-hidden="true">Examinar</span>
+              <input
+                id="previous-file"
+                name="previous"
+                type="file"
+                accept=".xlsx,.xlsb,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel.sheet.binary.macroEnabled.12"
+                required
+              />
+            </label>
+
+            <label class="file-card" for="lima-file" data-file-card="lima">
+              <span class="file-order">03</span>
+              <span class="file-body">
+                <span class="file-title">Cuotas Lima <span aria-hidden="true">*</span></span>
+                <span class="file-help">Cuotas por LOC.COM en formato .xlsx</span>
+                <span class="file-name" data-file-name="lima">Seleccionar archivo</span>
+              </span>
+              <span class="file-action" aria-hidden="true">Examinar</span>
+              <input
+                id="lima-file"
+                name="lima"
+                type="file"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                required
+              />
+            </label>
+          </fieldset>
+
+          <div class="settings-grid">
+            <div class="field-group">
+              <label for="sample-size">Muestra total de titulares <span aria-hidden="true">*</span></label>
+              <div class="number-field">
+                <input
+                  id="sample-size"
+                  name="sampleSize"
+                  type="text"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  value="17200"
+                  aria-describedby="sample-help"
+                  required
+                />
+                <span>puntos</span>
+              </div>
+              <p id="sample-help" class="field-help">Ejemplo: 17.200</p>
+            </div>
+
+            <fieldset class="field-group scope-field">
+              <legend>Canal que recibe el aumento</legend>
+              <input type="hidden" name="increaseScope" value="OFF" />
+              <div class="fixed-scope">
+                <strong>OFF</strong>
+                <span>ON permanece fijo en 1.285 titulares</span>
+              </div>
+              <p class="field-help">Las 14 cuotas ON por ciudad se conservan exactamente.</p>
+            </fieldset>
+          </div>
+
+          <div id="form-error" class="form-error" role="alert" hidden></div>
+
+          <button id="run-button" class="primary-button" type="submit">
+            <span class="button-label">Generar selección</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+        </form>
+      </section>
+
+      <section id="progress-panel" class="progress-panel" aria-live="polite" aria-atomic="true" hidden>
+        <div class="progress-head">
+          <div class="spinner" aria-hidden="true"></div>
+          <div>
+            <p class="step-label">Procesando</p>
+            <h2 id="progress-title">Preparando el motor de selección…</h2>
+          </div>
+          <span id="progress-percent" class="progress-percent">0%</span>
+        </div>
+        <div class="progress-track" aria-hidden="true">
+          <span id="progress-bar"></span>
+        </div>
+        <p id="progress-detail" class="progress-detail">
+          La primera ejecución puede tardar un poco mientras se carga el motor.
+        </p>
+      </section>
+
+      <section id="result-panel" class="result-panel" aria-labelledby="result-title" hidden>
+        <div class="result-mark" aria-hidden="true">✓</div>
+        <div class="result-copy">
+          <p class="step-label">Proceso terminado</p>
+          <h2 id="result-title">La selección está lista</h2>
+          <p id="result-summary"></p>
+          <div class="result-stats" aria-label="Resumen de titulares">
+            <div><span id="stat-total">—</span><small>Total</small></div>
+            <div><span id="stat-off">—</span><small>OFF</small></div>
+            <div><span id="stat-on">—</span><small>ON</small></div>
+          </div>
+          <div class="download-actions">
+            <a id="download-selection" class="download-button" href="#" download>
+              <span>Descargar selección</span>
+              <small>Archivo principal .xlsx</small>
+            </a>
+            <a id="download-supervision" class="download-button secondary" href="#" download>
+              <span>Descargar DEF / SUP</span>
+              <small>Archivo de supervisión .xlsx</small>
+            </a>
+          </div>
+          <button id="run-again" class="text-button" type="button">Generar otra selección</button>
+        </div>
+      </section>
+
+      <section id="error-panel" class="error-panel" aria-labelledby="error-title" hidden>
+        <div class="error-mark" aria-hidden="true">!</div>
+        <div>
+          <p class="step-label">No se pudo completar</p>
+          <h2 id="error-title">Revisa los archivos y vuelve a intentar</h2>
+          <p id="error-message"></p>
+          <details id="error-details-wrapper">
+            <summary>Ver detalle técnico</summary>
+            <pre id="error-details"></pre>
+          </details>
+          <button id="retry-button" class="text-button" type="button">Volver al formulario</button>
+        </div>
+      </section>
+
+      <footer>
+        <p>
+          El motor se ejecuta localmente con Python en el navegador. Se necesita conexión a internet
+          para cargarlo por primera vez.
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

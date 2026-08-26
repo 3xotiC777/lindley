@@ -36,6 +36,15 @@ def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     result["_mandatory"] = result["_is_titan"] | result["_fenix"].gt(0)
     result["_prev_t"] = result["SEL_MES_ANT"].astype(str).str.strip().str.upper().eq("T")
     result["_is_specialized"] = result["ESPECIALIZADA"].map(_is_specialized)
+    result["_selection_channel"] = np.where(
+        result["Subcanal2"].eq("ON") | result["CANAL"].eq("ON"), "ON", "OFF"
+    )
+    # RUT.COM is the physical route key. NOMBRE cannot be part of this key
+    # because the source deliberately contains a NOMBRE=0 quota bucket for
+    # rows belonging to the same route.
+    result["_off_qualified_route"] = result.groupby(
+        ["_selection_channel", "RUT.COM"], dropna=False
+    )["_mandatory"].transform("any") & result["_selection_channel"].eq("OFF")
     return result
 
 
@@ -48,6 +57,22 @@ def _historical_targets(historical: pd.DataFrame) -> tuple[pd.Series, pd.Series]
     )
 
 
+def _with_fixed_on_quotas(historical_targets: pd.Series) -> pd.Series:
+    """Replace historical ON totals with the exact approved city quotas."""
+    off_values = {
+        (str(city), str(subchannel)): int(value)
+        for (city, subchannel), value in historical_targets.items()
+        if str(subchannel) != "ON"
+    }
+    values = {
+        **off_values,
+        **{(city, "ON"): int(quota) for city, quota in config.ON_CITY_QUOTAS.items()},
+    }
+    keys = sorted(values)
+    index = pd.MultiIndex.from_tuples(keys, names=CITY_GROUP)
+    return pd.Series([values[key] for key in keys], index=index, dtype=int)
+
+
 def _city_group_bounds(
     df_elegible: pd.DataFrame,
     historical_targets: pd.Series,
@@ -55,12 +80,17 @@ def _city_group_bounds(
 ) -> tuple[list[tuple[str, str]], dict[tuple[str, str], int], dict[tuple[str, str], int]]:
     """Return current capacity and mandatory minimums for every historical/current city."""
     prepared = _prepare(df_elegible)
-    capacity_series = prepared.groupby(CITY_GROUP).size().astype(int)
+    capacity_mask = prepared["_selection_channel"].eq("ON") | prepared["_off_qualified_route"]
+    capacity_series = prepared.loc[capacity_mask].groupby(CITY_GROUP).size().astype(int)
     mandatory_series = prepared.loc[prepared["_mandatory"]].groupby(CITY_GROUP).size().astype(int)
 
     lower_bounds = {key: int(mandatory_series.get(key, 0)) for key in capacity_series.index}
     lima_key = ("LIMA", "OFF")
-    lima = prepared.loc[prepared["NOMBRE"].eq("LIMA") & prepared["Subcanal2"].eq("OFF")]
+    lima = prepared.loc[
+        prepared["NOMBRE"].eq("LIMA")
+        & prepared["Subcanal2"].eq("OFF")
+        & prepared["_off_qualified_route"]
+    ]
     if not lima.empty:
         quota_locations = set(lima_quotas)
         required_lima = int((lima["_mandatory"] & ~lima["LOC.COM"].isin(quota_locations)).sum())
@@ -94,6 +124,20 @@ def _anchored_historical_targets(
     groups, capacity, lower = _city_group_bounds(
         df_elegible, historical_targets, lima_quotas
     )
+    for city, quota in config.ON_CITY_QUOTAS.items():
+        key = (city, "ON")
+        available = int(capacity.get(key, 0))
+        mandatory = int(lower.get(key, 0))
+        if available < int(quota):
+            raise ValueError(
+                f"La cuota ON fija de {city} requiere {int(quota):,} puntos, "
+                f"pero la preselección solo tiene {available:,} elegibles ON."
+            )
+        if mandatory > int(quota):
+            raise ValueError(
+                f"{city} tiene {mandatory:,} puntos ON obligatorios Titán/Fénix, "
+                f"por encima de su cuota fija de {int(quota):,}."
+            )
     values = {
         key: max(lower[key], min(capacity[key], int(historical_targets.get(key, 0))))
         for key in groups
@@ -142,11 +186,19 @@ def _scaled_city_targets(
     baseline = _anchored_historical_targets(
         df_elegible, historical_targets, lima_quotas
     ).to_dict()
+    for city, quota in config.ON_CITY_QUOTAS.items():
+        baseline[(city, "ON")] = int(quota)
     baseline_total = int(sum(baseline.values()))
     if total_target < baseline_total:
         raise ValueError(
             f"La muestra solicitada ({total_target:,}) es menor que la base efectiva "
             f"del mes anterior ({baseline_total:,})."
+        )
+
+    if total_target > baseline_total and increase_scope != "OFF":
+        raise ValueError(
+            f"Las cuotas ON son fijas y deben sumar {int(config.ON_FIXED_TOTAL):,}. "
+            "Aplica cualquier aumento de la muestra únicamente al canal OFF."
         )
 
     if increase_scope == "OFF":
@@ -332,7 +384,8 @@ def _fill_city_total(
                 selected_by_segment[segment] += taken
 
     fill_remaining(primary_mask, within_band=True)
-    # Rule 3: only after exhausting Titan routes may OFF use a non-Titan route.
+    # Use a secondary universe only when the caller explicitly provides one.
+    # OFF passes no fallback, so it never leaves qualified Titán/Fénix routes.
     if fallback_mask is not None:
         fill_remaining(fallback_mask, within_band=True)
 
@@ -347,15 +400,21 @@ def _fill_city_total(
 def _ensure_lima_minimums(df_off: pd.DataFrame, lima_quotas: dict[str, int]) -> None:
     """Each Lima locality is a minimum; the city total can add PDVs afterwards."""
     for location, minimum in lima_quotas.items():
-        location_mask = df_off["NOMBRE"].eq("LIMA") & df_off["LOC.COM"].eq(location)
+        location_mask = (
+            df_off["NOMBRE"].eq("LIMA")
+            & df_off["LOC.COM"].eq(location)
+            & df_off["_off_qualified_route"]
+        )
         current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
         needed = int(minimum) - current
         if needed > 0:
-            _take(df_off, location_mask & df_off["_titan_route"], needed)
-            current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
-            # Fallback is explicitly limited to locations which cannot reach
-            # their minimum with the Titan-route universe.
-            _take(df_off, location_mask, int(minimum) - current)
+            _take(df_off, location_mask, needed)
+        current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
+        if current < int(minimum):
+            raise ValueError(
+                f"La cuota mínima de Lima para {location} requiere {int(minimum):,} puntos, "
+                f"pero solo hay {current:,} disponibles en rutas OFF con Titán o Fénix."
+            )
 
 
 def select_canal_off(
@@ -368,8 +427,6 @@ def select_canal_off(
     df_off = _prepare(df_off)
     preferred_on_routes = preferred_on_routes or set()
     df_off["_preferred_on_route"] = df_off["RUT.COM"].astype(str).isin(preferred_on_routes)
-    titan_routes = set(df_off.loc[df_off["_is_titan"], "RUT.COM"].dropna().astype(str))
-    df_off["_titan_route"] = df_off["RUT.COM"].astype(str).isin(titan_routes)
 
     # Rule 1: every Titán, Titán Plus or Fénix > 0 is a mandatory titular.
     # This has priority even if it exceeds a historical city/subchannel quota.
@@ -380,8 +437,18 @@ def select_canal_off(
     for (city, subchannel), target in off_targets.items():
         _fill_city_total(
             df_off, city, subchannel, int(target), strategy_targets,
-            df_off["_titan_route"], pd.Series(True, index=df_off.index), False,
+            df_off["_off_qualified_route"], None, False,
         )
+        actual = int((
+            df_off["NOMBRE"].eq(city)
+            & df_off["Subcanal2"].eq(subchannel)
+            & df_off[config.SELECTION_COL].eq("T")
+        ).sum())
+        if actual != int(target):
+            raise ValueError(
+                f"La cuota OFF de {city} ({int(target):,}) no cabe completamente en rutas "
+                f"que tengan al menos un punto Titán o Fénix; solo se pudieron asignar {actual:,}."
+            )
 
     _rebalance_off_route_overlap(df_off, preferred_on_routes, lima_quotas)
     _assign_substitutes(df_off)
@@ -405,7 +472,7 @@ def _rebalance_off_route_overlap(
             df_off.loc[
                 route_key.eq(preferred_route)
                 & df_off[config.SELECTION_COL].eq("NO")
-                & df_off["_titan_route"]
+                & df_off["_off_qualified_route"]
             ]
         )
         for incoming_index, incoming in incoming_candidates.iterrows():
@@ -449,7 +516,7 @@ def _rebalance_off_route_overlap(
 
 
 def _route_specialized_targets(group: pd.DataFrame, total_target: int) -> tuple[dict[str, int], int]:
-    """Prioritize SI route counts closest to 30 before the secondary 90/10 mix."""
+    """Balance specialized SI titles by route inside the 10–30 operating band."""
     specialized = group.loc[group["_is_specialized"]].copy()
     if specialized.empty:
         return {}, 0
@@ -460,118 +527,45 @@ def _route_specialized_targets(group: pd.DataFrame, total_target: int) -> tuple[
     ).astype(int)
     mandatory_si = int(route_stats["mandatory_si"].sum())
     mandatory_no = int((group["_mandatory"] & ~group["_is_specialized"]).sum())
+    available_no = int((~group["_is_specialized"]).sum())
     effective_total = max(int(total_target), mandatory_si + mandatory_no)
     max_si_within_total = max(0, effective_total - mandatory_no)
-    references = {
-        route: max(int(row.mandatory_si), min(config.ON_SPECIALIZED_ROUTE_MIN, int(row.available)))
-        for route, row in route_stats.iterrows()
-    }
+    references = {}
+    for route, row in route_stats.iterrows():
+        available = int(row.available)
+        mandatory = int(row.mandatory_si)
+        operating_available = available - 1 if available > mandatory else available
+        if operating_available >= int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN):
+            references[str(route)] = max(
+                mandatory,
+                min(int(config.ON_SPECIALIZED_ROUTE_MIN), operating_available),
+            )
+        elif mandatory > 0:
+            # A short route may only be active when it contains a mandatory
+            # Titán/Fénix point. Reserve one candidate whenever possible.
+            references[str(route)] = max(mandatory, operating_available)
+        else:
+            # Do not inflate the specialized target with an optional route
+            # that cannot reach the operating minimum of ten.
+            references[str(route)] = 0
     ideal_si = sum(references.values())
     target_si = max(
         mandatory_si,
         min(ideal_si, int(route_stats["available"].sum()), max_si_within_total),
     )
-
-    # Start with every mandatory SI. A forced route is first completed to at
-    # least 10 whenever the city quota permits; only then is it raised toward
-    # 30. Optional routes are not opened with a residue of 1-9: that residue is
-    # absorbed by active routes up to the normal ceiling of 35.
-    targets = {route: int(row.mandatory_si) for route, row in route_stats.iterrows()}
-    remaining = target_si - sum(targets.values())
-    forced_routes = [route for route in targets if targets[route] > 0]
-    forced_routes.sort(
-        key=lambda route: (
-            max(targets[route], min(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN, int(route_stats.loc[route, "available"])))
-            - targets[route],
-            -targets[route], -int(route_stats.loc[route, "available"]), route,
-        )
+    if (
+        0 < target_si < int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN)
+        and mandatory_si == 0
+        and available_no >= effective_total
+    ):
+        target_si = 0
+    if target_si <= 0:
+        return {str(route): 0 for route in route_stats.index}, 0
+    targets = _balanced_on_route_targets(
+        specialized,
+        target_si,
+        reserve_substitute=True,
     )
-
-    # Protect every mandatory route from ending at 1-9 when enough SI quota is
-    # available. A route with fewer than 10 available takes all of them.
-    for route in forced_routes:
-        if remaining <= 0:
-            break
-        active_floor = max(
-            targets[route],
-            min(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN, int(route_stats.loc[route, "available"])),
-        )
-        addition = min(remaining, active_floor - targets[route])
-        targets[route] += addition
-        remaining -= addition
-
-    # Bring forced routes toward 30 before opening another route.
-    forced_routes.sort(
-        key=lambda route: (
-            references[route] - targets[route], -targets[route], -int(route_stats.loc[route, "available"]), route
-        )
-    )
-    for route in forced_routes:
-        if remaining <= 0:
-            break
-        addition = min(remaining, references[route] - targets[route])
-        targets[route] += addition
-        remaining -= addition
-
-    optional_routes = [route for route in targets if targets[route] == 0]
-    optional_routes.sort(
-        key=lambda route: (
-            -min(config.ON_SPECIALIZED_ROUTE_MIN, int(route_stats.loc[route, "available"])),
-            -int(route_stats.loc[route, "available"]), route,
-        )
-    )
-    for route in optional_routes:
-        if remaining < config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN:
-            break
-        route_reference = references[route]
-        if route_reference < config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN:
-            continue
-        addition = min(remaining, route_reference)
-        if addition < config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN:
-            continue
-        targets[route] += addition
-        remaining -= addition
-
-    # A final residue below 10 is added to existing routes, normally stopping at
-    # 35, rather than creating an operationally unusable route with 1-9 points.
-    while remaining > 0:
-        candidates = [
-            route for route in targets
-            if targets[route] > 0
-            and targets[route] < min(config.ON_SPECIALIZED_ROUTE_MAX, int(route_stats.loc[route, "available"]))
-        ]
-        if not candidates:
-            break
-        route = min(
-            candidates,
-            key=lambda value: (
-                abs(config.ON_SPECIALIZED_ROUTE_MIN - targets[value]), targets[value],
-                -int(route_stats.loc[value, "available"]), value,
-            ),
-        )
-        targets[route] += 1
-        remaining -= 1
-
-    # Only when the exact city quota cannot be placed within the 10-35 operating
-    # band may a route below 10 be opened or an active route exceed 35.
-    for route in optional_routes:
-        if remaining <= 0:
-            break
-        if targets[route] > 0:
-            continue
-        addition = min(remaining, int(route_stats.loc[route, "available"]))
-        targets[route] += addition
-        remaining -= addition
-    while remaining > 0:
-        candidates = [
-            route for route in targets
-            if targets[route] < int(route_stats.loc[route, "available"])
-        ]
-        if not candidates:
-            break
-        route = min(candidates, key=lambda value: (targets[value], -int(route_stats.loc[value, "available"]), value))
-        targets[route] += 1
-        remaining -= 1
     return targets, target_si
 
 
@@ -590,7 +584,7 @@ def _select_on_route_specialized_targets(
 
         for route_key, route_target in sorted(route_targets.items()):
             all_targets[(city, route_key)] = route_target
-            route_mask = df_on["RUT.COM"].astype(str).eq(route_key)
+            route_mask = city_mask & df_on["RUT.COM"].astype(str).eq(route_key)
             while int((route_mask & df_on["_is_specialized"] & df_on[config.SELECTION_COL].eq("T")).sum()) < route_target:
                 available = df_on.loc[
                     route_mask & df_on["_is_specialized"] & df_on[config.SELECTION_COL].eq("NO")
@@ -632,8 +626,30 @@ def select_canal_on(df_on: pd.DataFrame, city_targets: pd.Series, strategy_targe
         )
 
     _rebalance_on_specialization(df_on, strategy_targets, route_targets)
-    _concentrate_on_non_specialized_titles(df_on)
+    _concentrate_on_non_specialized_titles(df_on, route_targets)
+    _ensure_on_route_substitute_capacity(df_on)
+    _rebalance_on_strategy_within_routes(df_on, strategy_targets)
+    for (city, subchannel), target in on_targets.items():
+        actual = int((
+            df_on["NOMBRE"].eq(city)
+            & df_on["Subcanal2"].eq(subchannel)
+            & df_on[config.SELECTION_COL].eq("T")
+        ).sum())
+        if actual != int(target):
+            raise RuntimeError(
+                f"La cuota ON de {city} debe ser {int(target):,}, pero quedó en {actual:,}."
+            )
     _assign_substitutes(df_on)
+    for (city, route), group in df_on.groupby(["NOMBRE", "RUT.COM"], dropna=False):
+        if not bool(group[config.SELECTION_COL].eq("T").any()):
+            continue
+        if bool(group[config.SELECTION_COL].isin(["S1", "S2", "S3"]).any()):
+            continue
+        optional_titles = group[config.SELECTION_COL].eq("T") & ~group["_mandatory"]
+        if bool(optional_titles.any()):
+            raise RuntimeError(
+                f"La ruta ON {route} de {city} quedó con titulares opcionales pero sin suplentes."
+            )
     return df_on.drop(columns=[column for column in df_on.columns if column.startswith("_")], errors="ignore")
 
 
@@ -783,7 +799,10 @@ def _rebalance_on_specialization(
             df_on.loc[_rank(incoming, prefer_specialized=False).index[0], config.SELECTION_COL] = "T"
 
 
-def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
+def _concentrate_on_non_specialized_titles(
+    df_on: pd.DataFrame,
+    route_targets: dict[tuple[str, str], int] | None = None,
+) -> None:
     """Pack optional ON/NO titles into viable route groups instead of one per route.
 
     Mandatory Titán/Fénix points are never moved. Optional non-specialized
@@ -793,10 +812,16 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
     within the same strategy, so the city total and strategy mix stay intact.
     """
     minimum = int(config.ON_NON_SPECIALIZED_ROUTE_MIN)
+    route_targets = route_targets or {}
     route_key = df_on["RUT.COM"].astype(str)
 
     for (city, subchannel), _group in df_on.groupby(["NOMBRE", "Subcanal2"], dropna=False):
         group_mask = df_on["NOMBRE"].eq(city) & df_on["Subcanal2"].eq(subchannel)
+        strategy_before = Counter(
+            df_on.loc[
+                group_mask & df_on[config.SELECTION_COL].eq("T"), "_segment"
+            ].astype(str)
+        )
         non_specialized = group_mask & ~df_on["_is_specialized"]
         optional_selected = (
             non_specialized
@@ -812,6 +837,21 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
         df_on.loc[optional_selected, config.SELECTION_COL] = "NO"
         remaining_by_segment = Counter(optional_targets)
         remaining_optional = int(sum(remaining_by_segment.values()))
+
+        def specialized_capacity_mask() -> pd.Series:
+            selected_si_counts = (
+                df_on.loc[
+                    group_mask
+                    & df_on[config.SELECTION_COL].eq("T")
+                    & df_on["_is_specialized"]
+                ]
+                .assign(_route_key=lambda frame: frame["RUT.COM"].astype(str))
+                .groupby("_route_key").size()
+            )
+            return route_key.map(
+                lambda route: int(selected_si_counts.get(str(route), 0))
+                < int(route_targets.get((city, str(route)), 0))
+            )
 
         # Complete mandatory NO routes first when they can reach the operating
         # minimum; afterwards open the fewest high-capacity routes possible.
@@ -897,6 +937,7 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
                 & df_on["_is_specialized"]
                 & df_on["_segment"].eq(segment)
                 & df_on[config.SELECTION_COL].eq("NO")
+                & specialized_capacity_mask()
             ]
             chosen = _rank(incoming, prefer_specialized=True).index[:needed]
             _set_selected(df_on, chosen)
@@ -912,6 +953,7 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
                 group_mask
                 & df_on["_is_specialized"]
                 & df_on[config.SELECTION_COL].eq("NO")
+                & specialized_capacity_mask()
             ]
             chosen = _rank(incoming_si, prefer_specialized=True).index[:remaining_optional]
             _set_selected(df_on, chosen)
@@ -965,11 +1007,25 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
             ]
             if not route_groups:
                 break
+            selected_si_counts = (
+                df_on.loc[
+                    group_mask
+                    & df_on["_is_specialized"]
+                    & df_on[config.SELECTION_COL].eq("T")
+                ]
+                .assign(_route_key=lambda frame: frame["RUT.COM"].astype(str))
+                .groupby("_route_key").size()
+            )
+            above_specialized_target = route_key.map(
+                lambda route: int(selected_si_counts.get(str(route), 0))
+                > int(route_targets.get((city, str(route)), 0))
+            )
             removable_si = df_on.loc[
                 group_mask
                 & df_on["_is_specialized"]
                 & df_on[config.SELECTION_COL].eq("T")
                 & ~df_on["_mandatory"]
+                & above_specialized_target
             ].sort_values(
                 by=["_preferred_on_route", "Esparta_Flag", "Ventas", "CODIGO"],
                 ascending=[True, True, True, False],
@@ -1069,9 +1125,409 @@ def _concentrate_on_non_specialized_titles(df_on: pd.DataFrame) -> None:
             if not moved:
                 break
 
+        _restore_on_group_strategy_counts(df_on, group_mask, strategy_before)
+
+
+def _restore_on_group_strategy_counts(
+    df_on: pd.DataFrame,
+    group_mask: pd.Series,
+    target_counts: Counter,
+) -> None:
+    """Undo strategy drift introduced while grouping non-specialized routes."""
+    route_key = df_on["RUT.COM"].astype(str)
+    non_specialized = group_mask & ~df_on["_is_specialized"]
+    segments = ("EG", "GR", "ME", "PE")
+
+    for _ in range(int(sum(target_counts.values())) + 1):
+        current = Counter(
+            df_on.loc[
+                group_mask & df_on[config.SELECTION_COL].eq("T"), "_segment"
+            ].astype(str)
+        )
+        deficits = [
+            segment for segment in segments
+            if current.get(segment, 0) < int(target_counts.get(segment, 0))
+        ]
+        donors = [
+            segment for segment in segments
+            if current.get(segment, 0) > int(target_counts.get(segment, 0))
+        ]
+        if not deficits or not donors:
+            return
+
+        swapped = False
+        for incoming_segment in deficits:
+            incoming_pool = df_on.loc[
+                non_specialized
+                & df_on["_segment"].eq(incoming_segment)
+                & df_on[config.SELECTION_COL].eq("NO")
+            ].copy()
+            if incoming_pool.empty:
+                continue
+            for outgoing_segment in donors:
+                outgoing_pool = df_on.loc[
+                    non_specialized
+                    & df_on["_segment"].eq(outgoing_segment)
+                    & df_on[config.SELECTION_COL].eq("T")
+                    & ~df_on["_mandatory"]
+                ].copy()
+                if outgoing_pool.empty:
+                    continue
+
+                # A swap inside one route preserves every route count. Prefer
+                # it before moving a title between two non-specialized routes.
+                common_routes = sorted(
+                    set(route_key.loc[incoming_pool.index])
+                    & set(route_key.loc[outgoing_pool.index])
+                )
+                if common_routes:
+                    route = common_routes[0]
+                    incoming = _rank(
+                        incoming_pool.loc[route_key.loc[incoming_pool.index].eq(route)]
+                    ).index[0]
+                    outgoing = _rank(
+                        outgoing_pool.loc[route_key.loc[outgoing_pool.index].eq(route)]
+                    ).index[-1]
+                else:
+                    # Across routes, prefer adding to an already active route
+                    # that will still retain at least one substitute candidate.
+                    title_counts = (
+                        df_on.loc[non_specialized & df_on[config.SELECTION_COL].eq("T")]
+                        .assign(_route_key_local=lambda frame: frame["RUT.COM"].astype(str))
+                        .groupby("_route_key_local").size()
+                    )
+                    remaining_counts = (
+                        df_on.loc[group_mask & df_on[config.SELECTION_COL].eq("NO")]
+                        .assign(_route_key_local=lambda frame: frame["RUT.COM"].astype(str))
+                        .groupby("_route_key_local").size()
+                    )
+                    incoming_pool["_active_route"] = route_key.loc[incoming_pool.index].map(
+                        lambda route: int(title_counts.get(str(route), 0)) > 0
+                    )
+                    incoming_pool["_keeps_substitute"] = route_key.loc[incoming_pool.index].map(
+                        lambda route: int(remaining_counts.get(str(route), 0)) >= 2
+                    )
+                    viable_incoming = incoming_pool.loc[incoming_pool["_keeps_substitute"]]
+                    if viable_incoming.empty:
+                        continue
+                    ranked_incoming = _rank(viable_incoming).sort_values(
+                        by=["_active_route", "_keeps_substitute"],
+                        ascending=[False, False],
+                        kind="stable",
+                    )
+                    incoming = ranked_incoming.index[0]
+                    outgoing_pool["_route_titles"] = route_key.loc[outgoing_pool.index].map(
+                        lambda route: int(title_counts.get(str(route), 0))
+                    )
+                    outgoing = _rank(outgoing_pool).sort_values(
+                        by="_route_titles", ascending=True, kind="stable"
+                    ).index[-1]
+
+                df_on.loc[outgoing, config.SELECTION_COL] = "NO"
+                df_on.loc[incoming, config.SELECTION_COL] = "T"
+                swapped = True
+                break
+            if swapped:
+                break
+        if not swapped:
+            return
+
+
+def _rebalance_on_strategy_within_routes(
+    df_on: pd.DataFrame,
+    strategy_targets: pd.Series,
+) -> None:
+    """Repair feasible +/-1 pp strategy gaps without changing route totals."""
+    segments = ("EG", "GR", "ME", "PE")
+    route_key = df_on["RUT.COM"].astype(str)
+    for (city, subchannel), _group in df_on.groupby(["NOMBRE", "Subcanal2"], dropna=False):
+        group_mask = df_on["NOMBRE"].eq(city) & df_on["Subcanal2"].eq(subchannel)
+        total = int((group_mask & df_on[config.SELECTION_COL].eq("T")).sum())
+        if total <= 0:
+            continue
+        historical = _strategy_targets_for(city, subchannel, strategy_targets)
+        _desired, lower, upper = _strategy_percentage_bands(historical, total)
+
+        for _ in range(total + 1):
+            current = Counter(
+                df_on.loc[
+                    group_mask & df_on[config.SELECTION_COL].eq("T"), "_segment"
+                ].astype(str)
+            )
+            deficits = [segment for segment in segments if current.get(segment, 0) < lower.get(segment, 0)]
+            donors = [segment for segment in segments if current.get(segment, 0) > lower.get(segment, 0)]
+            if not deficits or not donors:
+                break
+
+            swapped = False
+            for incoming_segment in deficits:
+                for outgoing_segment in donors:
+                    for specialized in (True, False):
+                        specialization = df_on["_is_specialized"].eq(specialized)
+                        outgoing_pool = df_on.loc[
+                            group_mask
+                            & specialization
+                            & df_on["_segment"].eq(outgoing_segment)
+                            & df_on[config.SELECTION_COL].eq("T")
+                            & ~df_on["_mandatory"]
+                        ]
+                        incoming_pool = df_on.loc[
+                            group_mask
+                            & specialization
+                            & df_on["_segment"].eq(incoming_segment)
+                            & df_on[config.SELECTION_COL].eq("NO")
+                        ]
+                        common_routes = sorted(
+                            set(route_key.loc[outgoing_pool.index])
+                            & set(route_key.loc[incoming_pool.index])
+                        )
+                        if not common_routes:
+                            continue
+                        route = common_routes[0]
+                        outgoing = _rank(
+                            outgoing_pool.loc[route_key.loc[outgoing_pool.index].eq(route)]
+                        ).index[-1]
+                        incoming = _rank(
+                            incoming_pool.loc[route_key.loc[incoming_pool.index].eq(route)],
+                            prefer_specialized=specialized,
+                        ).index[0]
+                        df_on.loc[outgoing, config.SELECTION_COL] = "NO"
+                        df_on.loc[incoming, config.SELECTION_COL] = "T"
+                        swapped = True
+                        break
+                    if swapped:
+                        break
+                if swapped:
+                    break
+            if not swapped:
+                break
+
+
+def _ensure_on_route_substitute_capacity(df_on: pd.DataFrame) -> None:
+    """Move optional titles away from routes that would have no substitute."""
+    route_key = df_on["RUT.COM"].astype(str)
+    for _ in range(len(df_on) + 1):
+        full_route = None
+        for (city, route), group in df_on.groupby(["NOMBRE", "RUT.COM"], dropna=False):
+            title_mask = group[config.SELECTION_COL].eq("T")
+            if bool(title_mask.any()) and bool(title_mask.all()) and bool((title_mask & ~group["_mandatory"]).any()):
+                full_route = (city, str(route), group)
+                break
+        if full_route is None:
+            return
+
+        city, route, group = full_route
+        outgoing_pool = group.loc[
+            group[config.SELECTION_COL].eq("T") & ~group["_mandatory"]
+        ].copy()
+        if outgoing_pool.empty:
+            return
+        outgoing = _rank(outgoing_pool).index[-1]
+        outgoing_segment = str(df_on.at[outgoing, "_segment"])
+        outgoing_specialized = bool(df_on.at[outgoing, "_is_specialized"])
+
+        city_mask = df_on["NOMBRE"].eq(city)
+        candidates = df_on.loc[
+            city_mask
+            & df_on[config.SELECTION_COL].eq("NO")
+            & ~route_key.eq(route)
+        ].copy()
+        if candidates.empty:
+            return
+        remaining_by_route = (
+            df_on.loc[city_mask & df_on[config.SELECTION_COL].eq("NO")]
+            .assign(_route_key_local=lambda frame: frame["RUT.COM"].astype(str))
+            .groupby("_route_key_local").size()
+        )
+        candidates = candidates.loc[
+            route_key.loc[candidates.index].map(
+                lambda candidate_route: int(remaining_by_route.get(str(candidate_route), 0)) >= 2
+            )
+        ].copy()
+        if candidates.empty:
+            return
+
+        same_segment = candidates.loc[candidates["_segment"].eq(outgoing_segment)]
+        candidates = same_segment if not same_segment.empty else candidates
+        title_routes = set(
+            route_key.loc[
+                city_mask & df_on[config.SELECTION_COL].eq("T")
+            ]
+        )
+        candidates["_same_specialization"] = candidates["_is_specialized"].eq(outgoing_specialized)
+        candidates["_active_route"] = route_key.loc[candidates.index].isin(title_routes)
+        incoming = _rank(candidates, prefer_specialized=outgoing_specialized).sort_values(
+            by=["_same_specialization", "_active_route"],
+            ascending=[False, False],
+            kind="stable",
+        ).index[0]
+
+        df_on.loc[outgoing, config.SELECTION_COL] = "NO"
+        df_on.loc[incoming, config.SELECTION_COL] = "T"
+
+
+def _balanced_on_route_targets(
+    group: pd.DataFrame,
+    total_target: int,
+    reserve_substitute: bool = True,
+) -> dict[str, int]:
+    """Return the closest feasible, level 10–30 distribution for active ON routes."""
+    route_min = int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN)
+    route_max = int(config.ON_SPECIALIZED_ROUTE_MAX)
+    local = group.assign(_route_key_local=group["RUT.COM"].astype(str))
+    stats = local.groupby("_route_key_local", dropna=False).agg(
+        available=("CODIGO", "size"),
+        mandatory=("_mandatory", "sum"),
+        current=(config.SELECTION_COL, lambda values: int(values.eq("T").sum())),
+        non_specialized=("_is_specialized", lambda values: int((~values).sum())),
+        sales=("Ventas", lambda values: float(pd.to_numeric(values, errors="coerce").fillna(0).sum())),
+    )
+
+    lower_if_active: dict[str, int] = {}
+    upper: dict[str, int] = {}
+    absolute_upper: dict[str, int] = {}
+    forced: set[str] = set()
+    active: set[str] = set()
+    for route, row in stats.iterrows():
+        route = str(route)
+        available = int(row.available)
+        mandatory = int(row.mandatory)
+        if available >= route_min:
+            floor = max(route_min, mandatory)
+            # Reserve one non-title for substitutes whenever this does not make
+            # the operating minimum impossible.
+            reserving_upper = available - 1
+            available_upper = (
+                reserving_upper
+                if reserve_substitute and reserving_upper >= floor
+                else available
+            )
+            ceiling = min(route_max, available_upper)
+        else:
+            floor = mandatory
+            ceiling = available
+        lower_if_active[route] = floor
+        upper[route] = max(mandatory, ceiling)
+        reserve_if_possible = (
+            available - 1
+            if reserve_substitute and available - 1 >= mandatory
+            else available
+        )
+        absolute_upper[route] = max(mandatory, reserve_if_possible)
+        if mandatory > 0:
+            forced.add(route)
+            active.add(route)
+        elif int(row.current) > 0 and available >= route_min:
+            active.add(route)
+
+    def floor_total(routes: set[str]) -> int:
+        return sum(lower_if_active[route] for route in routes)
+
+    def upper_total(routes: set[str]) -> int:
+        return sum(upper[route] for route in routes)
+
+    # If prior optional routes are too numerous for the minimum of 10, close
+    # the smallest ones first. Mandatory routes are never closed.
+    removable = sorted(
+        active - forced,
+        key=lambda route: (
+            int(stats.loc[route, "current"]),
+            upper[route],
+            int(stats.loc[route, "non_specialized"]),
+            route,
+        ),
+    )
+    while floor_total(active) > int(total_target) and removable:
+        active.remove(removable.pop(0))
+
+    # A small mandatory route may be mathematically unable to reach 10. Relax
+    # only its operating floor, never the mandatory count itself.
+    if floor_total(active) > int(total_target):
+        for route in forced:
+            lower_if_active[route] = int(stats.loc[route, "mandatory"])
+    if floor_total(active) > int(total_target):
+        raise ValueError("Los mínimos de rutas ON superan la cuota disponible del Nombre.")
+
+    # Open extra routes only when the existing active routes cannot hold the
+    # city quota under the maximum of 30. Prefer routes rich in NO-specialized
+    # points so displaced titles above 30 are absorbed there.
+    candidates = sorted(
+        [
+            route for route in stats.index.astype(str)
+            if route not in active and upper[route] >= route_min
+        ],
+        key=lambda route: (
+            int(stats.loc[route, "non_specialized"]),
+            upper[route],
+            float(stats.loc[route, "sales"]),
+            route,
+        ),
+        reverse=True,
+    )
+    while upper_total(active) < int(total_target):
+        candidate = next(
+            (
+                route for route in candidates
+                if floor_total(active) + lower_if_active[route] <= int(total_target)
+            ),
+            None,
+        )
+        if candidate is None:
+            # The city quota has explicit priority. If no additional route can
+            # reach 10, retain the smallest unavoidable overflow above 30 in an
+            # existing route, reserving a substitute whenever capacity permits.
+            relaxed = [route for route in active if absolute_upper[route] > upper[route]]
+            if relaxed:
+                for route in relaxed:
+                    upper[route] = absolute_upper[route]
+                continue
+            # Last mathematical fallback: use a route whose entire universe is
+            # below 10. This remains visible as an exception in Controls.
+            tiny = [
+                route for route in stats.index.astype(str)
+                if route not in active and upper[route] > 0
+            ]
+            if tiny:
+                route = max(
+                    tiny,
+                    key=lambda value: (
+                        upper[value], int(stats.loc[value, "non_specialized"]),
+                        float(stats.loc[value, "sales"]), value,
+                    ),
+                )
+                lower_if_active[route] = 0
+                active.add(route)
+                continue
+            raise ValueError(
+                f"La cuota ON de {int(total_target):,} supera el universo disponible de sus rutas."
+            )
+        active.add(candidate)
+        candidates.remove(candidate)
+
+    targets = {route: 0 for route in stats.index.astype(str)}
+    for route in active:
+        targets[route] = lower_if_active[route]
+    remaining = int(total_target) - sum(targets.values())
+    while remaining > 0:
+        choices = [route for route in active if targets[route] < upper[route]]
+        if not choices:
+            raise ValueError("No fue posible completar exactamente la cuota ON dentro del rango 10–30.")
+        route = min(
+            choices,
+            key=lambda value: (
+                targets[value],
+                -upper[value],
+                -int(stats.loc[value, "non_specialized"]),
+                value,
+            ),
+        )
+        targets[route] += 1
+        remaining -= 1
+    return targets
+
 
 def _assign_substitutes(df: pd.DataFrame) -> None:
-    """Assign continuous S1→S4 levels independently inside every title route.
+    """Assign continuous S1→S3 levels independently inside every title route.
 
     The function is called separately for OFF and ON, so a substitute can only
     belong to a route with a titular in that same channel. Candidates are also
@@ -1105,7 +1561,7 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
         default=3,
     )
 
-    levels = ("S1", "S2", "S3", "S4")
+    levels = ("S1", "S2", "S3")
     grouping = ["NOMBRE", "RUT.COM", "_sub_specialization"]
     for _key, candidates in df.loc[candidate_mask].groupby(grouping, dropna=False, sort=True):
         ordered = candidates.sort_values(
@@ -1255,69 +1711,95 @@ def build_controls(
         total = len(group)
         specialized = int(group["_is_specialized"].sum())
         reference_90 = int(np.floor(total * config.ON_SPECIALIZED_TARGET + 0.5))
-        city_on_all = on_all.loc[on_all["NOMBRE"].eq(city)]
-        _route_targets, target = _route_specialized_targets(
-            city_on_all, int(city_targets.get((city, "ON"), 0))
-        )
         rows.append({
-            "Control": "Especialización ON (secundaria a rutas cercanas a 30)", "Canal": "ON", "NOMBRE": city, "Subcanal2": "ON",
-            "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": target, "Titulares": specialized,
-            "Diferencia": specialized - target, "Referencia_90": reference_90,
+            "Control": "Especialización ON (referencia secundaria)", "Canal": "ON", "NOMBRE": city, "Subcanal2": "ON",
+            "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": reference_90, "Titulares": specialized,
+            "Diferencia": specialized - reference_90, "Referencia_90": reference_90,
             "Actual_%": round(specialized / total * 100, 2) if total else 0,
-            "Estado": "OK" if specialized == target else "REVISAR",
-            "Motivo": "Primero se acerca cada ruta activa a 30; 90/10 es una referencia secundaria" if specialized == target else "La disponibilidad de NO o los obligatorios impide mantener exactamente el objetivo por rutas",
+            "Estado": "OK" if specialized == reference_90 else "INFORMATIVO",
+            "Motivo": "El rango 10–30, el balance y la cuota exacta prevalecen; 90/10 queda como referencia secundaria",
         })
 
-    for city, group in on_all.groupby("NOMBRE"):
-        route_targets, _target_si = _route_specialized_targets(
-            group, int(city_targets.get((city, "ON"), 0))
-        )
+    for (city, subchannel), group in on_all.groupby(["NOMBRE", "Subcanal2"], dropna=False):
+        total_target = int(group[config.SELECTION_COL].eq("T").sum())
+        if total_target <= 0:
+            continue
+        route_targets, _target_si = _route_specialized_targets(group, total_target)
         group_route_key = group["RUT.COM"].astype(str)
         for route_key, route_target in sorted(route_targets.items()):
             route_mask = group_route_key.eq(route_key)
+            available = int(route_mask.sum())
             available_si = int((route_mask & group["_is_specialized"]).sum())
-            actual_si = int((route_mask & group["_is_specialized"] & group[config.SELECTION_COL].eq("T")).sum())
-            mandatory_si = int((route_mask & group["_is_specialized"] & group["_mandatory"]).sum())
-            if route_target == 0 and actual_si == 0:
+            actual = int((route_mask & group["_is_specialized"] & group[config.SELECTION_COL].eq("T")).sum())
+            total_titles_route = int((route_mask & group[config.SELECTION_COL].eq("T")).sum())
+            mandatory_route = int((route_mask & group["_is_specialized"] & group["_mandatory"]).sum())
+            substitutes_route = int((route_mask & group[config.SELECTION_COL].isin(["S1", "S2", "S3"])).sum())
+            if route_target == 0 and actual == 0:
                 continue
-            if actual_si != route_target:
+            if actual != route_target:
+                state = "INFORMATIVO" if actual > int(config.ON_SPECIALIZED_ROUTE_MAX) else "REVISAR"
+                reason = (
+                    "Excepción inevitable: no hay suficientes no especializados en rutas operativas para completar la cuota ON"
+                    if actual > int(config.ON_SPECIALIZED_ROUTE_MAX)
+                    else "La ruta no coincide con la distribución especializada balanceada calculada"
+                )
+            elif actual > int(config.ON_SPECIALIZED_ROUTE_MAX):
+                state = "INFORMATIVO"
+                reason = (
+                    f"Excepción inevitable sobre {int(config.ON_SPECIALIZED_ROUTE_MAX)} por falta de puntos no especializados"
+                )
+            elif actual < int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN):
+                state = "INFORMATIVO"
+                reason = (
+                    f"Ruta especializada obligatoria con {mandatory_route} Titán/Fénix y solo {available_si} puntos SI; "
+                    f"no puede alcanzar el mínimo de {int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN)}"
+                    if mandatory_route > 0
+                    else (
+                        "Excepción inevitable para completar la cuota ON: no existe capacidad suficiente "
+                        "en rutas no especializadas"
+                    )
+                )
+            elif substitutes_route == 0 and available > total_titles_route:
                 state = "REVISAR"
-                if actual_si > config.ON_SPECIALIZED_ROUTE_MAX:
-                    reason = "Superó 35 porque no había suficientes puntos NO para completar la cuota ON del Nombre"
+                reason = "La ruta tiene candidatos disponibles pero quedó sin suplentes"
+            elif substitutes_route == 0:
+                mandatory_all = int((route_mask & group["_mandatory"]).sum())
+                if mandatory_all >= total_titles_route and available == total_titles_route:
+                    state = "INFORMATIVO"
+                    reason = "Todos los puntos disponibles son titulares obligatorios; no existe candidato para suplente"
                 else:
-                    reason = "La disponibilidad o los obligatorios impidieron conservar exactamente la meta de la ruta"
-            elif actual_si < config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN:
-                state = "INFORMATIVO"
-                reason = (
-                    f"Quedó debajo de 10 porque contiene {mandatory_si} punto(s) obligatorio(s) "
-                    "y no había cuota suficiente para completar la ruta sin romper las demás reglas"
-                )
-            elif actual_si > config.ON_SPECIALIZED_ROUTE_MAX:
-                state = "INFORMATIVO"
-                reason = "Superó 35 porque no existía otra opción para cumplir la cuota ON del Nombre"
-            elif actual_si > config.ON_SPECIALIZED_ROUTE_MIN:
-                state = "INFORMATIVO"
-                reason = (
-                    "Quedó por encima de 30 porque no había otra opción sin abrir una ruta con menos de 10 "
-                    "y debía conservarse la cuota ON del Nombre"
-                )
-            elif actual_si == config.ON_SPECIALIZED_ROUTE_MIN:
-                state = "OK"
-                reason = "Ruta ubicada exactamente en la referencia de 30"
-            elif available_si < config.ON_SPECIALIZED_ROUTE_MIN and actual_si == available_si:
-                state = "OK"
-                reason = "La ruta tomó todos los especializados SI disponibles"
+                    state = "REVISAR"
+                    reason = "La selección consumió todos los candidatos de la ruta y no dejó suplente"
             else:
                 state = "OK"
-                reason = "Quedó entre 10 y 29 para conservar exactamente la cuota ON del Nombre"
+                reason = "Ruta especializada nivelada entre 10 y 30 y con suplentes disponibles"
             rows.append({
-                "Control": "Titulares SI por ruta ON (cercano a 30)", "Canal": "ON", "NOMBRE": city,
-                "Subcanal2": "ON", "RUT.COM": route_key, "ESTRATEGICA": "", "LOC.COM": "",
-                "Objetivo": route_target, "Titulares": actual_si, "Diferencia": actual_si - route_target,
-                "Disponibles_SI": available_si, "Obligatorios_SI": mandatory_si,
-                "Referencia_30": min(config.ON_SPECIALIZED_ROUTE_MIN, available_si),
+                "Control": "Titulares especializados por ruta ON (10–30 y balance)", "Canal": "ON", "NOMBRE": city,
+                "Subcanal2": subchannel, "RUT.COM": route_key, "ESTRATEGICA": "", "LOC.COM": "",
+                "Objetivo": route_target, "Titulares": actual, "Diferencia": actual - route_target,
+                "Disponibles_SI": available_si, "Obligatorios_SI": mandatory_route, "Suplentes": substitutes_route,
+                "Referencia_30": min(int(config.ON_SPECIALIZED_ROUTE_MAX), available_si),
                 "Estado": state, "Motivo": reason,
             })
+
+        comparable_targets = [
+            target for target in route_targets.values()
+            if target >= int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN)
+        ]
+        comparable_actual = [
+            int((group_route_key.eq(route) & group["_is_specialized"] & group[config.SELECTION_COL].eq("T")).sum())
+            for route, target in route_targets.items()
+            if target >= int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN)
+        ]
+        target_gap = max(comparable_targets) - min(comparable_targets) if comparable_targets else 0
+        actual_gap = max(comparable_actual) - min(comparable_actual) if comparable_actual else 0
+        rows.append({
+            "Control": "Nivelación de rutas especializadas ON por Nombre", "Canal": "ON", "NOMBRE": city,
+            "Subcanal2": subchannel, "RUT.COM": "VARIAS", "ESTRATEGICA": "", "LOC.COM": "",
+            "Objetivo": target_gap, "Titulares": actual_gap, "Diferencia": actual_gap - target_gap,
+            "Estado": "OK" if actual_gap == target_gap else "REVISAR",
+            "Motivo": "Las rutas comparables quedaron en el reparto entero más nivelado posible",
+        })
 
     mandatory = final["Programa de Valor"].map(_is_titan) | pd.to_numeric(final["Fenix"], errors="coerce").fillna(0).gt(0)
     mandatory_selected = int((mandatory & final[config.SELECTION_COL].eq("T")).sum())
@@ -1341,6 +1823,13 @@ def build_controls(
             "Estado": "OK" if abs(actual - target_substitutes) <= max(1, round(target_substitutes * 0.10)) else "VARIACION",
             "Motivo": "S1 limitado para mantener niveles S1/S2/S3 comparables",
         })
+    s4_count = int(substitute_counts.get("S4", 0))
+    rows.append({
+        "Control": "Ausencia de suplentes S4", "Canal": "TODOS", "NOMBRE": "VARIOS", "Subcanal2": "",
+        "ESTRATEGICA": "S4", "LOC.COM": "", "Objetivo": 0, "Titulares": s4_count,
+        "Diferencia": s4_count, "Estado": "OK" if s4_count == 0 else "REVISAR",
+        "Motivo": "Solo se generan S1, S2 y S3" if s4_count == 0 else "Se encontraron asignaciones S4",
+    })
 
     title_rows = final.loc[
         final[config.SELECTION_COL].eq("T"), ["_CANAL_SELECCION", "NOMBRE", "RUT.COM"]
@@ -1349,14 +1838,14 @@ def build_controls(
         (str(canal), str(city), str(route))
         for canal, city, route in title_rows.itertuples(index=False, name=None)
     )
-    substitutes = final[final[config.SELECTION_COL].isin(["S1", "S2", "S3", "S4"])].copy()
+    substitutes = final[final[config.SELECTION_COL].isin(["S1", "S2", "S3"])].copy()
     invalid_substitutes = int(sum(
         (str(canal), str(city), str(route)) not in title_routes
         for canal, city, route in substitutes[["_CANAL_SELECCION", "NOMBRE", "RUT.COM"]].itertuples(index=False, name=None)
     ))
     rows.append({
         "Control": "Suplentes solo en rutas con titulares", "Canal": "TODOS", "NOMBRE": "VARIOS",
-        "Subcanal2": "", "ESTRATEGICA": "S1-S4", "LOC.COM": "", "Objetivo": 0,
+        "Subcanal2": "", "ESTRATEGICA": "S1-S3", "LOC.COM": "", "Objetivo": 0,
         "Titulares": invalid_substitutes, "Diferencia": invalid_substitutes,
         "Estado": "OK" if invalid_substitutes == 0 else "REVISAR",
         "Motivo": "Ningún suplente está en una ruta sin T" if invalid_substitutes == 0 else "Hay suplentes asignados a rutas sin titular",
@@ -1376,13 +1865,12 @@ def build_controls(
         has_gap = (
             "S2" in present and "S1" not in present
             or "S3" in present and not {"S1", "S2"}.issubset(present)
-            or "S4" in present and not {"S1", "S2", "S3"}.issubset(present)
         )
         if has_gap:
             sequence_violations.append(key)
     rows.append({
-        "Control": "Secuencia S1-S4 por ruta y especialización", "Canal": "TODOS",
-        "NOMBRE": "VARIOS", "Subcanal2": "", "ESTRATEGICA": "S1-S4", "LOC.COM": "",
+        "Control": "Secuencia S1-S3 por ruta y especialización", "Canal": "TODOS",
+        "NOMBRE": "VARIOS", "Subcanal2": "", "ESTRATEGICA": "S1-S3", "LOC.COM": "",
         "Objetivo": 0, "Titulares": len(sequence_violations),
         "Diferencia": len(sequence_violations),
         "Estado": "OK" if not sequence_violations else "REVISAR",
@@ -1410,7 +1898,7 @@ def build_controls(
         )
         if bool((title_mask & ~mandatory_mask).any()) and int(title_mask.sum()) < int(config.ON_NON_SPECIALIZED_ROUTE_MIN):
             optional_small_routes += 1
-        has_substitute = bool(group[config.SELECTION_COL].isin(["S1", "S2", "S3", "S4"]).any())
+        has_substitute = bool(group[config.SELECTION_COL].isin(["S1", "S2", "S3"]).any())
         if not has_substitute:
             if bool((~title_mask).any()):
                 uncovered_with_candidates += 1
@@ -1421,12 +1909,15 @@ def build_controls(
         "NOMBRE": "VARIOS", "Subcanal2": "ON", "ESTRATEGICA": "", "LOC.COM": "",
         "Objetivo": 0, "Titulares": optional_small_routes,
         "Diferencia": optional_small_routes,
-        "Estado": "OK" if optional_small_routes == 0 else "REVISAR",
+        "Estado": "OK" if optional_small_routes == 0 else "INFORMATIVO",
         "Motivo": (
             f"Las rutas NO opcionales tienen al menos {config.ON_NON_SPECIALIZED_ROUTE_MIN} titulares; "
             "las rutas menores contienen únicamente puntos obligatorios"
             if optional_small_routes == 0
-            else "Hay rutas NO opcionales abiertas por debajo del mínimo de agrupación"
+            else (
+                "Excepciones NO menores usadas únicamente cuando son necesarias para conservar la cuota "
+                f"y evitar superar {config.ON_SPECIALIZED_ROUTE_MAX} especializados por ruta"
+            )
         ),
     })
     rows.append({
@@ -1454,13 +1945,17 @@ def build_controls(
         ].astype(str)
     )
     off_all = final.loc[final["_CANAL_SELECCION"].eq("OFF")]
-    off_titan_routes = set(
-        off_all.loc[off_all["Programa de Valor"].map(_is_titan), "RUT.COM"].astype(str)
+    off_qualified_routes = set(
+        off_all.loc[
+            off_all["Programa de Valor"].map(_is_titan)
+            | pd.to_numeric(off_all["Fenix"], errors="coerce").fillna(0).gt(0),
+            "RUT.COM",
+        ].astype(str)
     )
-    compatible_on_routes = on_title_routes & off_titan_routes
+    compatible_on_routes = on_title_routes & off_qualified_routes
     covered_on_routes = len(compatible_on_routes & off_title_routes)
     uncovered_compatible = compatible_on_routes - off_title_routes
-    without_compatible_off = on_title_routes - off_titan_routes
+    without_compatible_off = on_title_routes - off_qualified_routes
     rows.append({
         "Control": "Rutas con titulares ON también cubiertas en OFF", "Canal": "TODOS", "NOMBRE": "VARIOS",
         "Subcanal2": "", "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": len(compatible_on_routes),
@@ -1469,20 +1964,27 @@ def build_controls(
         "Estado": "OK" if not uncovered_compatible else "INFORMATIVO",
         "Motivo": (
             f"Se cubrieron las {covered_on_routes} rutas ON compatibles en OFF; "
-            f"{len(without_compatible_off)} no tienen el mismo RUT.COM dentro de una ruta Titán OFF"
+            f"{len(without_compatible_off)} no tienen el mismo RUT.COM dentro de una ruta Titán/Fénix OFF"
             if not uncovered_compatible
             else f"Faltan {len(uncovered_compatible)} rutas compatibles por cubrir sin romper las demás reglas"
         ),
     })
 
     off = final[final["_CANAL_SELECCION"].eq("OFF")]
-    titan_routes = set(off.loc[off["Programa de Valor"].map(_is_titan), "RUT.COM"].astype(str))
-    fallback_titles = int((off[config.SELECTION_COL].eq("T") & ~off["RUT.COM"].astype(str).isin(titan_routes)).sum())
+    qualified_routes = set(
+        off.loc[
+            off["Programa de Valor"].map(_is_titan)
+            | pd.to_numeric(off["Fenix"], errors="coerce").fillna(0).gt(0),
+            "RUT.COM",
+        ].astype(str)
+    )
+    selected_or_substitute = off[config.SELECTION_COL].isin(["T", "S1", "S2", "S3"])
+    invalid_off_selections = int((selected_or_substitute & ~off["RUT.COM"].astype(str).isin(qualified_routes)).sum())
     rows.append({
-        "Control": "Fallback OFF fuera de ruta Titán", "Canal": "OFF", "NOMBRE": "VARIOS", "Subcanal2": "",
-        "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": 0, "Titulares": fallback_titles,
-        "Diferencia": fallback_titles, "Estado": "OK" if fallback_titles == 0 else "INFORMATIVO",
-        "Motivo": "No fue necesario" if fallback_titles == 0 else "Incluye puntos obligatorios o el fallback tras agotar rutas Titán",
+        "Control": "Selecciones OFF solo en rutas Titán/Fénix", "Canal": "OFF", "NOMBRE": "VARIOS", "Subcanal2": "",
+        "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0, "Titulares": invalid_off_selections,
+        "Diferencia": invalid_off_selections, "Estado": "OK" if invalid_off_selections == 0 else "REVISAR",
+        "Motivo": "Todas las selecciones OFF pertenecen a rutas calificadas" if invalid_off_selections == 0 else "Hay titulares o suplentes OFF en rutas sin Titán/Fénix",
     })
     return pd.DataFrame(rows)
 
@@ -1495,6 +1997,7 @@ def run_selection_process(
 ):
     print("Running selection rules on the ELEGIBLE universe...")
     historical_city_targets, strategy_targets = _historical_targets(historical)
+    historical_city_targets = _with_fixed_on_quotas(historical_city_targets)
     lima_quotas = config.load_lima_quotas()
     requested_total = int(total_target) if total_target is not None else int(historical_city_targets.sum())
     increase_scope = str(increase_scope).strip().upper()
@@ -1518,6 +2021,19 @@ def run_selection_process(
     final["SEL_ON"] = (final["_CANAL_SELECCION"].eq("ON") & final[config.SELECTION_COL].eq("T")).astype(int)
     final["SEL_TOTAL"] = final["SEL_OFF"] + final["SEL_ON"]
     final["VISITAS"] = final["VISITAS_ANT"] + final["SEL_TOTAL"]
+    actual_total = int(final[config.SELECTION_COL].eq("T").sum())
+    actual_on = int((
+        final["_CANAL_SELECCION"].eq("ON")
+        & final[config.SELECTION_COL].eq("T")
+    ).sum())
+    if actual_total != requested_total:
+        raise RuntimeError(
+            f"La muestra debe sumar {requested_total:,} titulares, pero quedó en {actual_total:,}."
+        )
+    if actual_on != int(config.ON_FIXED_TOTAL):
+        raise RuntimeError(
+            f"Las cuotas ON deben sumar {int(config.ON_FIXED_TOTAL):,}, pero quedaron en {actual_on:,}."
+        )
     controls = build_controls(
         final, city_targets, historical_city_targets, strategy_targets, lima_quotas,
         requested_total, increase_scope,
