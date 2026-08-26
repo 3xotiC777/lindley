@@ -1,0 +1,41 @@
+# Datos de entrada y resultados: nunca publicar en el repositorio público.
+*.xlsx
+*.xlsb
+*.csv
+
+# Perfiles, audio, datos geográficos y temporales locales.
+edge_temp_profile_2/
+transcripts/
+data*.json
+data.js
+temp_test.js
+*.log
+
+# Builds y entornos locales.
+__pycache__/
+*.py[cod]
+.codex-work/
+artifact_verify/
+build_exe*/
+ejecutable_estrategia_1pp/
+dist/
+.venv/
+venv/
+
+# Archivos del visor geográfico ajeno a este selector.
+/index.html
+/index-*.html
+/vendor_leaflet.*
+/build_fully_offline_html.py
+/build_single_file.py
+/fix_script.py
+/generate_app.py
+/process_data.py
+/debug_edge.py
+/inspect_console_errors.py
+
+# Sistema/editor.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
