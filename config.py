@@ -29,8 +29,9 @@ ON_SPECIALIZED_ROUTE_ACTIVE_MIN = 10
 ON_SPECIALIZED_ROUTE_MAX = 30
 ON_NON_SPECIALIZED_ROUTE_MIN = 4
 
-# Cuotas ON operativas confirmadas por Planeación. Son valores exactos: el
-# aumento de la muestra mensual se asigna a OFF y nunca recalcula estas cuotas.
+# Cuotas ON operativas confirmadas por Planeación. Son la base por ciudad:
+# permanecen exactas cuando el aumento se asigna solo a OFF y actúan como
+# mínimos antes de distribuir un aumento elegido para ON o para ambos canales.
 ON_CITY_QUOTAS = {
     "AREQUIPA": 65,
     "CHICLAYO": 50,
@@ -47,7 +48,9 @@ ON_CITY_QUOTAS = {
     "CUSCO": 50,
     "TACNA": 25,
 }
-ON_FIXED_TOTAL = sum(ON_CITY_QUOTAS.values())
+ON_BASE_TOTAL = sum(ON_CITY_QUOTAS.values())
+# Alias conservado para integraciones anteriores que importan este nombre.
+ON_FIXED_TOTAL = ON_BASE_TOTAL
 
 # The August input has the Esparta field empty.  These are the Esparta cities
 # documented in the original selection procedure; a populated Esparta flag is

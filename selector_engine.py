@@ -58,7 +58,7 @@ def _historical_targets(historical: pd.DataFrame) -> tuple[pd.Series, pd.Series]
 
 
 def _with_fixed_on_quotas(historical_targets: pd.Series) -> pd.Series:
-    """Replace historical ON totals with the exact approved city quotas."""
+    """Replace historical ON totals with the approved city base quotas."""
     off_values = {
         (str(city), str(subchannel)): int(value)
         for (city, subchannel), value in historical_targets.items()
@@ -82,6 +82,20 @@ def _city_group_bounds(
     prepared = _prepare(df_elegible)
     capacity_mask = prepared["_selection_channel"].eq("ON") | prepared["_off_qualified_route"]
     capacity_series = prepared.loc[capacity_mask].groupby(CITY_GROUP).size().astype(int)
+    # A route with optional ON candidates must retain at least one non-title so
+    # that S1 can be assigned. Account for that reserve before distributing an
+    # increase; otherwise a small city can receive its entire raw universe and
+    # only fail after selection has already consumed the route.
+    on_route_stats = (
+        prepared.loc[prepared["_selection_channel"].eq("ON")]
+        .groupby([*CITY_GROUP, "RUT.COM"], dropna=False)
+        .agg(available=("CODIGO", "size"), mandatory=("_mandatory", "sum"))
+        .astype(int)
+    )
+    for (city, subchannel, _route), row in on_route_stats.iterrows():
+        if int(row.available) > int(row.mandatory):
+            key = (city, subchannel)
+            capacity_series.loc[key] = max(0, int(capacity_series.loc[key]) - 1)
     mandatory_series = prepared.loc[prepared["_mandatory"]].groupby(CITY_GROUP).size().astype(int)
 
     lower_bounds = {key: int(mandatory_series.get(key, 0)) for key in capacity_series.index}
@@ -133,11 +147,6 @@ def _anchored_historical_targets(
                 f"La cuota ON fija de {city} requiere {int(quota):,} puntos, "
                 f"pero la preselección solo tiene {available:,} elegibles ON."
             )
-        if mandatory > int(quota):
-            raise ValueError(
-                f"{city} tiene {mandatory:,} puntos ON obligatorios Titán/Fénix, "
-                f"por encima de su cuota fija de {int(quota):,}."
-            )
     values = {
         key: max(lower[key], min(capacity[key], int(historical_targets.get(key, 0))))
         for key in groups
@@ -186,19 +195,11 @@ def _scaled_city_targets(
     baseline = _anchored_historical_targets(
         df_elegible, historical_targets, lima_quotas
     ).to_dict()
-    for city, quota in config.ON_CITY_QUOTAS.items():
-        baseline[(city, "ON")] = int(quota)
     baseline_total = int(sum(baseline.values()))
     if total_target < baseline_total:
         raise ValueError(
             f"La muestra solicitada ({total_target:,}) es menor que la base efectiva "
             f"del mes anterior ({baseline_total:,})."
-        )
-
-    if total_target > baseline_total and increase_scope != "OFF":
-        raise ValueError(
-            f"Las cuotas ON son fijas y deben sumar {int(config.ON_FIXED_TOTAL):,}. "
-            "Aplica cualquier aumento de la muestra únicamente al canal OFF."
         )
 
     if increase_scope == "OFF":
@@ -2030,9 +2031,13 @@ def run_selection_process(
         raise RuntimeError(
             f"La muestra debe sumar {requested_total:,} titulares, pero quedó en {actual_total:,}."
         )
-    if actual_on != int(config.ON_FIXED_TOTAL):
+    expected_on = int(sum(
+        value for (_city, subchannel), value in city_targets.items()
+        if subchannel == "ON"
+    ))
+    if actual_on != expected_on:
         raise RuntimeError(
-            f"Las cuotas ON deben sumar {int(config.ON_FIXED_TOTAL):,}, pero quedaron en {actual_on:,}."
+            f"Las cuotas ON calculadas deben sumar {expected_on:,}, pero quedaron en {actual_on:,}."
         )
     controls = build_controls(
         final, city_targets, historical_city_targets, strategy_targets, lima_quotas,

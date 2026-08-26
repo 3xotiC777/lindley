@@ -12,9 +12,11 @@ La página permite cargar:
 2. la selección del mes anterior en `.xlsx` o `.xlsb`;
 3. las cuotas de Lima en `.xlsx`.
 
-También permite indicar la muestra total. La ciudad se identifica mediante la
-columna `NOMBRE`. Las cuotas ON son fijas por ciudad, suman 1.285 y cualquier
-aumento se aplica únicamente a `OFF`. Al terminar, entrega:
+También permite indicar la muestra total y elegir si el aumento se asigna a
+`OFF`, `ON` o a ambos canales. La ciudad se identifica mediante la columna
+`NOMBRE`. Las 14 cuotas ON forman una base de 1.285 titulares: permanecen
+exactas al elegir `OFF` y, al elegir `ON` o ambos, el incremento se distribuye
+por encima de esa base. Al terminar, entrega:
 
 - `SELECCION_MUESTRA_LINDLEY_RESULTADO.xlsx`;
 - `ARCHIVO_DEF_SUP_LINDLEY_RESULTADO.xlsx`.

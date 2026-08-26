@@ -16,7 +16,7 @@ import selector_engine
 
 OUTPUT_NAME = "SELECCION_MUESTRA_LINDLEY_RESULTADO.xlsx"
 SUPERVISION_NAME = "ARCHIVO_DEF_SUP_LINDLEY_RESULTADO.xlsx"
-VALID_SCOPES = {"OFF"}
+VALID_SCOPES = {"OFF", "ON", "AMBOS"}
 
 
 def run_browser_selection(
@@ -35,7 +35,7 @@ def run_browser_selection(
 
     increase_scope = str(increase_scope).strip().upper()
     if increase_scope not in VALID_SCOPES:
-        raise ValueError("El aumento debe aplicarse a OFF porque las cuotas ON son fijas.")
+        raise ValueError("El canal del aumento debe ser OFF, ON o AMBOS.")
 
     preselection_path = Path(preselection_path)
     previous_path = Path(previous_path)

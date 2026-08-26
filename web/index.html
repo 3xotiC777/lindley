@@ -127,12 +127,23 @@
 
             <fieldset class="field-group scope-field">
               <legend>Canal que recibe el aumento</legend>
-              <input type="hidden" name="increaseScope" value="OFF" />
-              <div class="fixed-scope">
-                <strong>OFF</strong>
-                <span>ON permanece fijo en 1.285 titulares</span>
+              <div class="segmented-control" aria-describedby="scope-help">
+                <label>
+                  <input type="radio" name="increaseScope" value="OFF" checked />
+                  <span>OFF</span>
+                </label>
+                <label>
+                  <input type="radio" name="increaseScope" value="ON" />
+                  <span>ON</span>
+                </label>
+                <label>
+                  <input type="radio" name="increaseScope" value="AMBOS" />
+                  <span>Ambos</span>
+                </label>
               </div>
-              <p class="field-help">Las 14 cuotas ON por ciudad se conservan exactamente.</p>
+              <p id="scope-help" class="field-help">
+                La base ON conserva sus 14 cuotas por ciudad (1.285); el aumento se reparte según esta opción.
+              </p>
             </fieldset>
           </div>
 

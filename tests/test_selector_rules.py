@@ -23,6 +23,37 @@ def route_group(specs):
     return pd.DataFrame(rows)
 
 
+def scope_universe(extra_on=20, off_capacity=140):
+    """Build enough eligible capacity to exercise all three increase scopes."""
+    rows = []
+    code = 1
+    for city, quota in config.ON_CITY_QUOTAS.items():
+        for position in range(quota + extra_on):
+            rows.append({
+                "CODIGO": code, "NOMBRE": city, "Subcanal2": "ON", "CANAL": "ON",
+                "RUT.COM": f"{city}-ON", "ESTRATEGICA": "GR", "Fenix": 0,
+                "Programa de Valor": "0", "SEL_MES_ANT": "NO", "ESPECIALIZADA": "NO",
+                "LOC.COM": "",
+            })
+            code += 1
+    for position in range(off_capacity):
+        rows.append({
+            "CODIGO": code, "NOMBRE": "LIMA", "Subcanal2": "OFF", "CANAL": "OFF",
+            "RUT.COM": "LIMA-OFF", "ESTRATEGICA": "GR", "Fenix": 1 if position == 0 else 0,
+            "Programa de Valor": "0", "SEL_MES_ANT": "NO", "ESPECIALIZADA": "NO",
+            "LOC.COM": "OTRA",
+        })
+        code += 1
+    index = pd.MultiIndex.from_tuples(
+        [(city, "ON") for city in config.ON_CITY_QUOTAS] + [("LIMA", "OFF")],
+        names=selector_engine.CITY_GROUP,
+    )
+    historical = pd.Series(
+        [*config.ON_CITY_QUOTAS.values(), 100], index=index, dtype=int,
+    )
+    return pd.DataFrame(rows), historical
+
+
 class OnRouteTargetTests(unittest.TestCase):
     def test_fixed_on_quotas_sum_to_approved_total(self):
         index = pd.MultiIndex.from_tuples(
@@ -34,6 +65,50 @@ class OnRouteTargetTests(unittest.TestCase):
         on_total = int(fixed[fixed.index.get_level_values("Subcanal2") == "ON"].sum())
         self.assertEqual(on_total, 1285)
         self.assertEqual(int(fixed.get(("HUARAZ", "ON"))), 25)
+
+    def test_increase_scope_off_keeps_on_at_approved_base(self):
+        universe, historical = scope_universe()
+        targets = selector_engine._scaled_city_targets(
+            universe, historical, config.ON_BASE_TOTAL + 112, {}, "OFF",
+        )
+        target_on = int(sum(
+            value for (_city, subchannel), value in targets.items() if subchannel == "ON"
+        ))
+        self.assertEqual(target_on, config.ON_BASE_TOTAL)
+        self.assertEqual(int(targets[("LIMA", "OFF")]), 112)
+
+    def test_on_capacity_reserves_a_substitute_per_optional_route(self):
+        universe, historical = scope_universe(extra_on=2)
+        _groups, capacity, _lower = selector_engine._city_group_bounds(
+            universe, historical, {},
+        )
+        self.assertEqual(
+            capacity[("HUARAZ", "ON")],
+            config.ON_CITY_QUOTAS["HUARAZ"] + 1,
+        )
+
+    def test_increase_scope_on_keeps_off_at_historical_base(self):
+        universe, historical = scope_universe()
+        targets = selector_engine._scaled_city_targets(
+            universe, historical, config.ON_BASE_TOTAL + 112, {}, "ON",
+        )
+        target_on = int(sum(
+            value for (_city, subchannel), value in targets.items() if subchannel == "ON"
+        ))
+        self.assertEqual(target_on, config.ON_BASE_TOTAL + 12)
+        self.assertEqual(int(targets[("LIMA", "OFF")]), 100)
+
+    def test_increase_scope_both_distributes_above_both_bases(self):
+        universe, historical = scope_universe()
+        targets = selector_engine._scaled_city_targets(
+            universe, historical, config.ON_BASE_TOTAL + 120, {}, "AMBOS",
+        )
+        target_on = int(sum(
+            value for (_city, subchannel), value in targets.items() if subchannel == "ON"
+        ))
+        self.assertEqual(int(targets.sum()), config.ON_BASE_TOTAL + 120)
+        self.assertGreater(target_on, config.ON_BASE_TOTAL)
+        self.assertGreater(int(targets[("LIMA", "OFF")]), 100)
 
     def test_arequipa_is_levelled_across_three_routes(self):
         group = route_group([
