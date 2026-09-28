@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import openpyxl
 import pandas as pd
-import pyxlsb
 
 import config
 
@@ -15,6 +14,74 @@ def _key(value) -> str:
     text = unicodedata.normalize("NFKD", str(value))
     text = "".join(char for char in text if not unicodedata.combining(char))
     return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def load_cda_quotas(file_path) -> tuple[dict[str, dict[str, int | str]], int]:
+    """Read the General sheet's CDA targets; blank On Premise means zero."""
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        if "General" not in wb.sheetnames:
+            raise ValueError("El archivo de cuotas CDA debe contener la hoja General.")
+        rows = list(wb["General"].iter_rows(values_only=True))
+    finally:
+        wb.close()
+
+    header_row = None
+    columns = {}
+    for position, row in enumerate(rows):
+        found = {_key(value): column for column, value in enumerate(row) if value is not None}
+        if {"LOCACIONCIUDAD", "ONPREMISE", "TOTAL"}.issubset(found):
+            header_row = position
+            columns = found
+            break
+    if header_row is None:
+        raise ValueError("No se encontraron las columnas LOCACION/CIUDAD, On Premise y Total.")
+
+    def whole_number(value, label, cda):
+        if value is None or str(value).strip() == "":
+            return 0
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"La cuota {label} de {cda} no es numérica.") from error
+        if not number.is_integer() or number < 0:
+            raise ValueError(f"La cuota {label} de {cda} debe ser un entero no negativo.")
+        return int(number)
+
+    quotas = {}
+    for row in rows[header_row + 1:]:
+        name = row[columns["LOCACIONCIUDAD"]] if columns["LOCACIONCIUDAD"] < len(row) else None
+        if name is None or not str(name).strip():
+            continue
+        name = str(name).strip()
+        key = _key(name)
+        if not key:
+            raise ValueError(f"El CDA {name!r} no tiene una identificación válida.")
+        if key in quotas:
+            raise ValueError(f"El CDA {name} aparece más de una vez en las cuotas.")
+        on = whole_number(row[columns["ONPREMISE"]], "On Premise", name)
+        total = whole_number(row[columns["TOTAL"]], "Total", name)
+        if on > total:
+            raise ValueError(f"La cuota ON de {name} supera su Total.")
+        quotas[key] = {"name": name, "ON": on, "OFF": total - on}
+    if not quotas:
+        raise ValueError("La hoja General no contiene cuotas por CDA.")
+
+    grand_total = sum(int(item["ON"]) + int(item["OFF"]) for item in quotas.values())
+    summary_total = next(
+        (
+            row[columns["TOTAL"]]
+            for row in rows[header_row + 1:]
+            if len(row) > columns["TOTAL"] and
+            any(_key(value) in {"TOTAL", "TOTALGENERAL"} for value in row[:columns["LOCACIONCIUDAD"] + 1] if value is not None)
+        ),
+        None,
+    )
+    if summary_total is not None and grand_total != whole_number(summary_total, "Total general", "General"):
+        raise ValueError(
+            f"La suma por CDA es {grand_total:,}, pero el Total general indica {int(summary_total):,}."
+        )
+    return quotas, grand_total
 
 
 def _find_column(columns, expected: str) -> str:
@@ -93,6 +160,8 @@ def load_previous_selection(file_path):
     rows = []
 
     if suffix == ".xlsb":
+        import pyxlsb
+
         with pyxlsb.open_workbook(file_path) as wb:
             sheet_name = next(
                 (sheet for sheet in wb.sheets if "SELECCION_MUESTRA" in sheet.upper() or sheet.upper() == "BD"),

@@ -1,5 +1,6 @@
 from collections import Counter
 import math
+import re
 import unicodedata
 
 import numpy as np
@@ -10,6 +11,11 @@ import config
 
 CITY_GROUP = ["NOMBRE", "Subcanal2"]
 STRATEGY_GROUP = ["NOMBRE", "Subcanal2", "ESTRATEGICA"]
+
+
+def _cda_key(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value).upper())
+    return re.sub(r"[^A-Z0-9]", "", "".join(char for char in text if not unicodedata.combining(char)))
 
 
 def _is_titan(value) -> bool:
@@ -400,9 +406,10 @@ def _fill_city_total(
 
 def _ensure_lima_minimums(df_off: pd.DataFrame, lima_quotas: dict[str, int]) -> None:
     """Each Lima locality is a minimum; the city total can add PDVs afterwards."""
+    source_city = df_off.get("CDA_ORIG_CITY", df_off["NOMBRE"])
     for location, minimum in lima_quotas.items():
         location_mask = (
-            df_off["NOMBRE"].eq("LIMA")
+            source_city.eq("LIMA")
             & df_off["LOC.COM"].eq(location)
             & df_off["_off_qualified_route"]
         )
@@ -466,6 +473,7 @@ def _rebalance_off_route_overlap(
         return
 
     route_key = df_off["RUT.COM"].astype(str)
+    source_city = df_off.get("CDA_ORIG_CITY", df_off["NOMBRE"])
     for preferred_route in sorted(preferred_on_routes):
         if bool((route_key.eq(preferred_route) & df_off[config.SELECTION_COL].eq("T")).any()):
             continue
@@ -492,18 +500,18 @@ def _rebalance_off_route_overlap(
                 & ~df_off["_mandatory"]
                 & ~protected_overlap
             )
-            if incoming["NOMBRE"] == "LIMA":
+            if (incoming["CDA_ORIG_CITY"] if "CDA_ORIG_CITY" in incoming else incoming["NOMBRE"]) == "LIMA":
                 for location, minimum in lima_quotas.items():
                     location_selected = int(
                         (
-                            df_off["NOMBRE"].eq("LIMA")
+                            source_city.eq("LIMA")
                             & df_off["LOC.COM"].eq(location)
                             & df_off[config.SELECTION_COL].eq("T")
                         ).sum()
                     )
                     if location_selected <= int(minimum):
                         removable &= ~(
-                            df_off["NOMBRE"].eq("LIMA") & df_off["LOC.COM"].eq(location)
+                            source_city.eq("LIMA") & df_off["LOC.COM"].eq(location)
                         )
             outgoing = df_off.loc[removable].sort_values(
                 by=["_preferred_on_route", "_is_titan", "Esparta_Flag", "Ventas", "CODIGO"],
@@ -641,7 +649,8 @@ def select_canal_on(df_on: pd.DataFrame, city_targets: pd.Series, strategy_targe
                 f"La cuota ON de {city} debe ser {int(target):,}, pero quedó en {actual:,}."
             )
     _assign_substitutes(df_on)
-    for (city, route), group in df_on.groupby(["NOMBRE", "RUT.COM"], dropna=False):
+    route_city = "CDA_ORIG_CITY" if "CDA_ORIG_CITY" in df_on else "NOMBRE"
+    for (city, route), group in df_on.groupby([route_city, "RUT.COM"], dropna=False):
         if not bool(group[config.SELECTION_COL].eq("T").any()):
             continue
         if bool(group[config.SELECTION_COL].isin(["S1", "S2", "S3"]).any()):
@@ -1535,7 +1544,8 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
     split by specialization: a route with NO-specialized titulares receives its
     own S1 first whenever another NO-specialized candidate exists.
     """
-    route_columns = ["NOMBRE", "RUT.COM"]
+    city_column = "CDA_ORIG_CITY" if "CDA_ORIG_CITY" in df else "NOMBRE"
+    route_columns = [city_column, "RUT.COM"]
     title_routes = set(
         tuple(str(value) for value in row)
         for row in df.loc[df[config.SELECTION_COL].eq("T"), route_columns].itertuples(index=False, name=None)
@@ -1551,7 +1561,8 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
     df.loc[candidate_mask, "_sub_specialization"] = df.loc[candidate_mask, "_is_specialized"].map(
         {False: "NO", True: "SI"}
     )
-    esparta = df["Esparta_Flag"].eq(1) | df["NOMBRE"].isin(config.ESPARTA_CITIES)
+    source_city = df.get("CDA_ORIG_CITY", df["NOMBRE"])
+    esparta = df["Esparta_Flag"].eq(1) | source_city.isin(config.ESPARTA_CITIES)
     df.loc[candidate_mask, "_sub_priority"] = np.select(
         [
             esparta[candidate_mask] & df.loc[candidate_mask, "_segment"].isin(["ME", "PE"]),
@@ -1563,7 +1574,7 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
     )
 
     levels = ("S1", "S2", "S3")
-    grouping = ["NOMBRE", "RUT.COM", "_sub_specialization"]
+    grouping = [city_column, "RUT.COM", "_sub_specialization"]
     for _key, candidates in df.loc[candidate_mask].groupby(grouping, dropna=False, sort=True):
         ordered = candidates.sort_values(
             by=["_sub_priority", "_mandatory", "_prev_t", "Ventas", "CODIGO"],
@@ -1582,6 +1593,92 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
             start += level_count
 
 
+def _select_with_cda_quotas(
+    df_elegible: pd.DataFrame,
+    historical_strategy_targets: pd.Series,
+    cda_quotas: dict[str, dict[str, int | str]],
+    lima_quotas: dict[str, int],
+) -> pd.DataFrame:
+    """Use the existing route selectors with CDA quotas as their group targets."""
+    if "DES LOC_COM" not in df_elegible.columns:
+        raise ValueError("El universo no contiene la columna DES LOC_COM para aplicar cuotas CDA.")
+
+    eligible = df_elegible.copy()
+    eligible["CDA_ORIG_CITY"] = eligible["NOMBRE"]
+    eligible["CDA_QUOTA_KEY"] = eligible["DES LOC_COM"].map(_cda_key)
+    eligible["_CDA_CHANNEL"] = np.where(
+        eligible["Subcanal2"].eq("ON") | eligible["CANAL"].eq("ON"), "ON", "OFF"
+    )
+    prepared = _prepare(eligible)
+    uncovered_mandatory = prepared["_mandatory"] & ~prepared["CDA_QUOTA_KEY"].isin(cda_quotas)
+    if bool(uncovered_mandatory.any()):
+        names = sorted(prepared.loc[uncovered_mandatory, "DES LOC_COM"].astype(str).unique())
+        raise ValueError(
+            "Hay puntos Titán/Fénix obligatorios fuera de las cuotas CDA: "
+            + ", ".join(names[:5])
+            + ("…" if len(names) > 5 else "")
+        )
+
+    excluded = eligible.loc[~eligible["CDA_QUOTA_KEY"].isin(cda_quotas)].copy()
+    eligible = eligible.loc[eligible["CDA_QUOTA_KEY"].isin(cda_quotas)].copy()
+    eligible["NOMBRE"] = eligible["CDA_QUOTA_KEY"]
+    keys = sorted((key, channel) for key in cda_quotas for channel in ("OFF", "ON"))
+    target_index = pd.MultiIndex.from_tuples(keys, names=CITY_GROUP)
+    targets = pd.Series(
+        [int(cda_quotas[key][channel]) for key, channel in keys], index=target_index, dtype=int
+    )
+    _groups, capacity, lower = _city_group_bounds(eligible, targets, {})
+    problems = []
+    for key, channel in keys:
+        target = int(targets[(key, channel)])
+        available = int(capacity.get((key, channel), 0))
+        mandatory = int(lower.get((key, channel), 0))
+        name = str(cda_quotas[key]["name"])
+        if target > available:
+            problems.append(f"{name} {channel}: cuota {target:,}, capacidad elegible {available:,}")
+        elif target < mandatory:
+            problems.append(f"{name} {channel}: cuota {target:,}, obligatorios {mandatory:,}")
+    if problems:
+        raise ValueError(
+            "Las cuotas CDA no caben en el universo y las reglas de rutas. "
+            + "; ".join(problems[:6])
+            + (f"; y {len(problems) - 6} CDA/canales más" if len(problems) > 6 else "")
+        )
+
+    # Each CDA inherits the historical strategy proportions of its principal
+    # city. The existing selectors then enforce route and substitute rules
+    # inside each CDA instead of the former city quota group.
+    strategy_values = {}
+    for key, channel in keys:
+        group = eligible.loc[eligible["NOMBRE"].eq(key) & eligible["_CDA_CHANNEL"].eq(channel)]
+        named = group.loc[group["CDA_ORIG_CITY"].ne("0"), "CDA_ORIG_CITY"]
+        source = named if not named.empty else group["CDA_ORIG_CITY"]
+        city = str(source.value_counts().index[0]) if not source.empty else ""
+        for segment in ("EG", "GR", "ME", "PE"):
+            strategy_values[(key, channel, segment)] = int(
+                historical_strategy_targets.get((city, channel, segment), 0)
+            )
+    strategy_index = pd.MultiIndex.from_tuples(sorted(strategy_values), names=STRATEGY_GROUP)
+    strategy_targets = pd.Series(
+        [strategy_values[key] for key in strategy_index], index=strategy_index, dtype=int
+    )
+
+    on_mask = eligible["_CDA_CHANNEL"].eq("ON")
+    selected_on = select_canal_on(eligible.loc[on_mask], targets, strategy_targets)
+    on_routes = set(selected_on.loc[selected_on[config.SELECTION_COL].eq("T"), "RUT.COM"].astype(str))
+    selected_off = select_canal_off(
+        eligible.loc[~on_mask], targets, strategy_targets, lima_quotas,
+        preferred_on_routes=on_routes,
+    )
+    selected_on["_CANAL_SELECCION"] = "ON"
+    selected_off["_CANAL_SELECCION"] = "OFF"
+    excluded[config.SELECTION_COL] = "NO"
+    excluded["_CANAL_SELECCION"] = excluded["_CDA_CHANNEL"]
+    final = pd.concat([selected_off, selected_on, excluded], ignore_index=True)
+    final["NOMBRE"] = final["CDA_ORIG_CITY"]
+    return final
+
+
 def build_controls(
     final: pd.DataFrame,
     city_targets: pd.Series,
@@ -1590,6 +1687,7 @@ def build_controls(
     lima_quotas: dict[str, int],
     total_target: int,
     increase_scope: str,
+    cda_quotas: dict[str, dict[str, int | str]] | None = None,
 ) -> pd.DataFrame:
     rows = []
     selected = final[final[config.SELECTION_COL].eq("T")].copy()
@@ -1601,8 +1699,10 @@ def build_controls(
         "Diferencia": actual_total - int(total_target), "Estado": "OK" if actual_total == int(total_target) else "REVISAR",
         "Motivo": "Muestra total cumplida" if actual_total == int(total_target) else "Los mínimos obligatorios o la disponibilidad impiden igualar la muestra",
     })
-    effective_historical = _anchored_historical_targets(
-        final, historical_city_targets, lima_quotas
+    effective_historical = (
+        historical_city_targets
+        if cda_quotas is not None
+        else _anchored_historical_targets(final, historical_city_targets, lima_quotas)
     )
     historical_on = int(sum(
         value for (_city, subchannel), value in effective_historical.items() if subchannel == "ON"
@@ -1610,7 +1710,7 @@ def build_controls(
     historical_off = int(effective_historical.sum()) - historical_on
     target_on = int(sum(value for (city, subchannel), value in city_targets.items() if subchannel == "ON"))
     target_off = int(city_targets.sum()) - target_on
-    fixed_ok = (
+    fixed_ok = cda_quotas is not None or (
         increase_scope == "AMBOS"
         or increase_scope == "OFF" and target_on == historical_on
         or increase_scope == "ON" and target_off == historical_off
@@ -1625,6 +1725,9 @@ def build_controls(
         "Historico_OFF": historical_off, "Objetivo_OFF": target_off,
         "Estado": "OK" if fixed_ok else "REVISAR",
         "Motivo": (
+            "El total y ambos canales se toman de las cuotas CDA"
+            if cda_quotas is not None
+            else
             "El aumento se distribuyó proporcionalmente entre OFF y ON, después de fijar cada cuota histórica"
             if increase_scope == "AMBOS"
             else f"El canal {'ON' if increase_scope == 'OFF' else 'OFF'} permaneció en su base del mes anterior"
@@ -1633,9 +1736,22 @@ def build_controls(
         ),
     })
 
+    if cda_quotas is not None:
+        actual_cda = selected.groupby(["CDA_QUOTA_KEY", "_CANAL_SELECCION"]).size()
+        for key, channel in sorted((key, channel) for key in cda_quotas for channel in ("OFF", "ON")):
+            target = int(cda_quotas[key][channel])
+            actual = int(actual_cda.get((key, channel), 0))
+            rows.append({
+                "Control": "Cuota CDA por canal", "Canal": channel, "NOMBRE": "", "Subcanal2": channel,
+                "CDA": str(cda_quotas[key]["name"]), "ESTRATEGICA": "", "LOC.COM": "",
+                "Objetivo": target, "Titulares": actual, "Diferencia": actual - target,
+                "Estado": "OK" if actual == target else "REVISAR",
+                "Motivo": "Cuota CDA cumplida" if actual == target else "La cuota CDA no se pudo completar",
+            })
+
     actual_city = selected.groupby(CITY_GROUP).size()
     all_city_groups = set(city_targets.index.to_list()) | set(actual_city.index.to_list())
-    for city, subchannel in sorted(all_city_groups):
+    for city, subchannel in sorted(all_city_groups if cda_quotas is None else []):
         target = int(city_targets.get((city, subchannel), 0))
         actual = int(actual_city.get((city, subchannel), 0))
         status = "OK" if actual == target else "REVISAR"
@@ -1995,29 +2111,35 @@ def run_selection_process(
     historical: pd.DataFrame,
     total_target: int | None = None,
     increase_scope: str = "AMBOS",
+    cda_quotas: dict[str, dict[str, int | str]] | None = None,
 ):
     print("Running selection rules on the ELEGIBLE universe...")
     historical_city_targets, strategy_targets = _historical_targets(historical)
-    historical_city_targets = _with_fixed_on_quotas(historical_city_targets)
     lima_quotas = config.load_lima_quotas()
-    requested_total = int(total_target) if total_target is not None else int(historical_city_targets.sum())
-    increase_scope = str(increase_scope).strip().upper()
-    city_targets = _scaled_city_targets(
-        df_elegible, historical_city_targets, requested_total, lima_quotas, increase_scope,
-    )
-    on_mask = df_elegible["Subcanal2"].eq("ON") | df_elegible["CANAL"].eq("ON")
-    selected_on = select_canal_on(df_elegible.loc[on_mask], city_targets, strategy_targets)
-    on_title_routes = set(
-        selected_on.loc[selected_on[config.SELECTION_COL].eq("T"), "RUT.COM"].astype(str)
-    )
-    selected_off = select_canal_off(
-        df_elegible.loc[~on_mask], city_targets, strategy_targets, lima_quotas,
-        preferred_on_routes=on_title_routes,
-    )
-    selected_on["_CANAL_SELECCION"] = "ON"
-    selected_off["_CANAL_SELECCION"] = "OFF"
-
-    final = pd.concat([selected_off, selected_on], ignore_index=True)
+    if cda_quotas is None:
+        historical_city_targets = _with_fixed_on_quotas(historical_city_targets)
+        requested_total = int(total_target) if total_target is not None else int(historical_city_targets.sum())
+        increase_scope = str(increase_scope).strip().upper()
+        city_targets = _scaled_city_targets(
+            df_elegible, historical_city_targets, requested_total, lima_quotas, increase_scope,
+        )
+        on_mask = df_elegible["Subcanal2"].eq("ON") | df_elegible["CANAL"].eq("ON")
+        selected_on = select_canal_on(df_elegible.loc[on_mask], city_targets, strategy_targets)
+        on_title_routes = set(
+            selected_on.loc[selected_on[config.SELECTION_COL].eq("T"), "RUT.COM"].astype(str)
+        )
+        selected_off = select_canal_off(
+            df_elegible.loc[~on_mask], city_targets, strategy_targets, lima_quotas,
+            preferred_on_routes=on_title_routes,
+        )
+        selected_on["_CANAL_SELECCION"] = "ON"
+        selected_off["_CANAL_SELECCION"] = "OFF"
+        final = pd.concat([selected_off, selected_on], ignore_index=True)
+    else:
+        requested_total = sum(int(values["ON"]) + int(values["OFF"]) for values in cda_quotas.values())
+        increase_scope = "CUOTAS CDA"
+        final = _select_with_cda_quotas(df_elegible, strategy_targets, cda_quotas, lima_quotas)
+        city_targets = final.loc[final[config.SELECTION_COL].eq("T")].groupby(CITY_GROUP).size()
     final["SEL_OFF"] = (final["_CANAL_SELECCION"].eq("OFF") & final[config.SELECTION_COL].eq("T")).astype(int)
     final["SEL_ON"] = (final["_CANAL_SELECCION"].eq("ON") & final[config.SELECTION_COL].eq("T")).astype(int)
     final["SEL_TOTAL"] = final["SEL_OFF"] + final["SEL_ON"]
@@ -2031,18 +2153,39 @@ def run_selection_process(
         raise RuntimeError(
             f"La muestra debe sumar {requested_total:,} titulares, pero quedó en {actual_total:,}."
         )
-    expected_on = int(sum(
-        value for (_city, subchannel), value in city_targets.items()
-        if subchannel == "ON"
-    ))
+    expected_on = (
+        sum(int(values["ON"]) for values in cda_quotas.values())
+        if cda_quotas is not None else
+        int(sum(value for (_city, subchannel), value in city_targets.items() if subchannel == "ON"))
+    )
     if actual_on != expected_on:
         raise RuntimeError(
             f"Las cuotas ON calculadas deben sumar {expected_on:,}, pero quedaron en {actual_on:,}."
         )
     controls = build_controls(
         final, city_targets, historical_city_targets, strategy_targets, lima_quotas,
-        requested_total, increase_scope,
+        requested_total, increase_scope, cda_quotas,
     )
+    if cda_quotas is not None:
+        mismatched = controls.loc[
+            controls["Control"].eq("Cuota CDA por canal") & controls["Estado"].ne("OK")
+        ]
+        if not mismatched.empty:
+            row = mismatched.iloc[0]
+            raise RuntimeError(
+                f"La cuota {row['Canal']} de {row['CDA']} debe ser {int(row['Objetivo']):,}, "
+                f"pero quedó en {int(row['Titulares']):,}."
+            )
+        rule_failures = controls.loc[controls["Estado"].eq("REVISAR")]
+        if not rule_failures.empty:
+            row = rule_failures.iloc[0]
+            location = str(row.get("NOMBRE", "") or row.get("CDA", "")).strip()
+            raise ValueError(
+                f"Las cuotas CDA no permiten cumplir todas las reglas: {row['Control']}"
+                + (f" ({location})" if location else "")
+                + f". {row['Motivo']}"
+            )
+        final = final.drop(columns=["CDA_ORIG_CITY", "CDA_QUOTA_KEY", "_CDA_CHANNEL"], errors="ignore")
     print(f"Selection complete. Total Titulares: {int(final[config.SELECTION_COL].eq('T').sum())}")
     print(controls["Estado"].value_counts().to_dict())
     return final, controls

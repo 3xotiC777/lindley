@@ -177,16 +177,21 @@ async function executeSelection(payload) {
     preselection: `${inputDir}/preselection.xlsx`,
     previous: `${inputDir}/previous${previousExtension}`,
     lima: `${inputDir}/lima.xlsx`,
+    cda: payload.inputs.cda ? `${inputDir}/cda.xlsx` : null,
   };
 
   fs.writeFile(inputPaths.preselection, new Uint8Array(payload.inputs.preselection.buffer));
   fs.writeFile(inputPaths.previous, new Uint8Array(payload.inputs.previous.buffer));
   fs.writeFile(inputPaths.lima, new Uint8Array(payload.inputs.lima.buffer));
+  if (inputPaths.cda) {
+    fs.writeFile(inputPaths.cda, new Uint8Array(payload.inputs.cda.buffer));
+  }
 
   const parameters = JSON.stringify({
     preselectionPath: inputPaths.preselection,
     previousPath: inputPaths.previous,
     limaPath: inputPaths.lima,
+    cdaPath: inputPaths.cda,
     outputDir,
     totalTarget: Number(payload.sampleSize),
     increaseScope: String(payload.increaseScope || "OFF"),
@@ -205,6 +210,7 @@ json.dumps(
         preselection_path=_browser_job["preselectionPath"],
         previous_path=_browser_job["previousPath"],
         lima_path=_browser_job["limaPath"],
+        cda_path=_browser_job["cdaPath"],
         output_dir=_browser_job["outputDir"],
         total_target=_browser_job["totalTarget"],
         increase_scope=_browser_job["increaseScope"],

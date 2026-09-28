@@ -10,13 +10,23 @@ La página permite cargar:
 
 1. la preselección actual en `.xlsx`;
 2. la selección del mes anterior en `.xlsx` o `.xlsb`;
-3. las cuotas de Lima en `.xlsx`.
+3. las cuotas de Lima en `.xlsx`;
+4. opcionalmente, las cuotas por CDA en `.xlsx` (hoja `General`).
 
 También permite indicar la muestra total y elegir si el aumento se asigna a
 `OFF`, `ON` o a ambos canales. La ciudad se identifica mediante la columna
 `NOMBRE`. Las 14 cuotas ON forman una base de 1.285 titulares: permanecen
 exactas al elegir `OFF` y, al elegir `ON` o ambos, el incremento se distribuye
-por encima de esa base. Al terminar, entrega:
+por encima de esa base.
+
+Si se adjuntan cuotas por CDA, las columnas `LOCACION/CIUDAD`, `On Premise` y
+`Total` determinan toda la muestra: ON = `On Premise`, OFF = `Total - On Premise`.
+La página cruza el CDA con `DES LOC_COM` del universo y toma el total de la
+suma de las filas, sin usar el tamaño ni el canal de aumento manuales. Una
+cuota que no cabe en el universo elegible o en las rutas permitidas produce un
+error con el CDA afectado; no se redistribuye silenciosamente a otro CDA.
+
+Al terminar, entrega:
 
 - `SELECCION_MUESTRA_LINDLEY_RESULTADO.xlsx`;
 - `ARCHIVO_DEF_SUP_LINDLEY_RESULTADO.xlsx`.

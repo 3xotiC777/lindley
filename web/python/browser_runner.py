@@ -27,10 +27,10 @@ def run_browser_selection(
     output_dir,
     total_target,
     increase_scope,
+    cda_path=None,
 ):
     """Run the production selection flow with files stored in Pyodide's FS."""
-    total_target = int(total_target)
-    if total_target <= 0:
+    if cda_path is None and (total_target is None or int(total_target) <= 0):
         raise ValueError("La muestra total debe ser un número entero mayor que cero.")
 
     increase_scope = str(increase_scope).strip().upper()
@@ -40,6 +40,7 @@ def run_browser_selection(
     preselection_path = Path(preselection_path)
     previous_path = Path(previous_path)
     lima_path = Path(lima_path)
+    cda_path = Path(cda_path) if cda_path else None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,6 +51,8 @@ def run_browser_selection(
     ):
         if not path.is_file():
             raise FileNotFoundError(f"No se encontró el archivo de {label}.")
+    if cda_path and not cda_path.is_file():
+        raise FileNotFoundError("No se encontró el archivo de cuotas CDA.")
 
     config.WORK_PRESELECCION_PATH = preselection_path
     config.WORK_PREV_SELECCION_PATH = previous_path
@@ -58,11 +61,17 @@ def run_browser_selection(
     config.OUTPUT_DEF_SUP_PATH = output_dir / SUPERVISION_NAME
 
     eligible, non_eligible, historical = ingest.prepare_merged_datasets()
+    cda_quotas = None
+    if cda_path:
+        cda_quotas, total_target = ingest.load_cda_quotas(cda_path)
+    else:
+        total_target = int(total_target)
     final, controls = selector_engine.run_selection_process(
         eligible,
         historical,
         total_target=total_target,
         increase_scope=increase_scope,
+        cda_quotas=cda_quotas,
     )
     exporter.export_selection_workbook(
         final,
@@ -92,7 +101,7 @@ def run_browser_selection(
         "actualTotal": actual_total,
         "actualOn": actual_on,
         "actualOff": actual_off,
-        "increaseScope": increase_scope,
+        "increaseScope": "CUOTAS CDA" if cda_quotas is not None else increase_scope,
         "controlsReview": controls_review,
         "selectionFile": config.OUTPUT_SELECCION_PATH.name,
         "supervisionFile": config.OUTPUT_DEF_SUP_PATH.name,

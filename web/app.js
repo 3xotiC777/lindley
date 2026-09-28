@@ -14,6 +14,8 @@ const errorMessage = document.querySelector("#error-message");
 const errorDetails = document.querySelector("#error-details");
 const errorDetailsWrapper = document.querySelector("#error-details-wrapper");
 const sampleSizeInput = document.querySelector("#sample-size");
+const manualSettings = document.querySelector("#manual-settings");
+const cdaModeNote = document.querySelector("#cda-mode-note");
 const runAgainButton = document.querySelector("#run-again");
 const retryButton = document.querySelector("#retry-button");
 
@@ -21,6 +23,7 @@ const inputs = {
   preselection: document.querySelector("#preselection-file"),
   previous: document.querySelector("#previous-file"),
   lima: document.querySelector("#lima-file"),
+  cda: document.querySelector("#cda-file"),
 };
 
 const downloads = {
@@ -38,6 +41,7 @@ const allowedExtensions = {
   preselection: [".xlsx"],
   previous: [".xlsx", ".xlsb"],
   lima: [".xlsx"],
+  cda: [".xlsx"],
 };
 
 let worker;
@@ -87,12 +91,13 @@ function validateForm() {
   Object.entries(inputs).forEach(([key, input]) => {
     const file = input.files?.[0];
     const card = document.querySelector(`[data-file-card="${key}"]`);
-    if (!file) {
+    if (!file && key !== "cda") {
       issues.push("Selecciona los tres archivos de entrada.");
       card.classList.add("has-error");
       input.setAttribute("aria-invalid", "true");
       return;
     }
+    if (!file) return;
     if (!allowedExtensions[key].includes(extensionOf(file.name))) {
       issues.push(`El archivo “${file.name}” no tiene el formato esperado.`);
       card.classList.add("has-error");
@@ -104,15 +109,16 @@ function validateForm() {
     }
   });
 
-  const sampleSize = normalizedSampleSize();
-  if (sampleSize === null) {
+  const useCda = Boolean(inputs.cda.files?.[0]);
+  const sampleSize = useCda ? null : normalizedSampleSize();
+  if (!useCda && sampleSize === null) {
     issues.push("Escribe la muestra total como un número entero positivo.");
     sampleSizeInput.setAttribute("aria-invalid", "true");
   }
 
   const uniqueIssues = [...new Set(issues)];
   setFormError(uniqueIssues.join(" "));
-  return uniqueIssues.length === 0 ? sampleSize : null;
+  return uniqueIssues.length === 0 ? { sampleSize, useCda } : null;
 }
 
 function setProgress({ title, detail, percent }) {
@@ -249,7 +255,7 @@ function showFailure(message, details = "") {
   scrollToPanel(errorPanel);
 }
 
-async function startSelection(sampleSize) {
+async function startSelection({ sampleSize, useCda }) {
   if (isRunning) return;
   isRunning = true;
   currentRunId += 1;
@@ -267,13 +273,17 @@ async function startSelection(sampleSize) {
     const preselection = inputs.preselection.files[0];
     const previous = inputs.previous.files[0];
     const lima = inputs.lima.files[0];
-    const [preselectionBuffer, previousBuffer, limaBuffer] = await Promise.all([
+    const cda = inputs.cda.files?.[0];
+    const [preselectionBuffer, previousBuffer, limaBuffer, cdaBuffer] = await Promise.all([
       preselection.arrayBuffer(),
       previous.arrayBuffer(),
       lima.arrayBuffer(),
+      cda?.arrayBuffer(),
     ]);
 
-    const increaseScope = form.elements.increaseScope.value;
+    const increaseScope = form.querySelector('input[name="increaseScope"]:checked')?.value || "OFF";
+    const transferables = [preselectionBuffer, previousBuffer, limaBuffer];
+    if (cdaBuffer) transferables.push(cdaBuffer);
     makeWorker().postMessage(
       {
         type: "run",
@@ -285,10 +295,11 @@ async function startSelection(sampleSize) {
             preselection: { name: preselection.name, buffer: preselectionBuffer },
             previous: { name: previous.name, buffer: previousBuffer },
             lima: { name: lima.name, buffer: limaBuffer },
+            cda: useCda ? { name: cda.name, buffer: cdaBuffer } : null,
           },
         },
       },
-      [preselectionBuffer, previousBuffer, limaBuffer],
+      transferables,
     );
   } catch (error) {
     showFailure("No fue posible leer uno de los archivos seleccionados.", error?.stack || String(error));
@@ -304,6 +315,11 @@ Object.entries(inputs).forEach(([key, input]) => {
     card.classList.remove("has-error");
     input.removeAttribute("aria-invalid");
     name.textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "Seleccionar archivo";
+    if (key === "cda") {
+      manualSettings.hidden = Boolean(file);
+      cdaModeNote.hidden = !file;
+      sampleSizeInput.required = !file;
+    }
     setFormError();
   });
 });
@@ -320,8 +336,8 @@ sampleSizeInput.addEventListener("focus", () => {
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
-  const sampleSize = validateForm();
-  if (sampleSize !== null) startSelection(sampleSize);
+  const settings = validateForm();
+  if (settings !== null) startSelection(settings);
 });
 
 runAgainButton.addEventListener("click", () => {

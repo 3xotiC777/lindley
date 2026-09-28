@@ -104,9 +104,28 @@
                 required
               />
             </label>
+
+            <label class="file-card" for="cda-file" data-file-card="cda">
+              <span class="file-order">04</span>
+              <span class="file-body">
+                <span class="file-title">Cuotas por CDA <span class="optional-label">Opcional</span></span>
+                <span class="file-help">General .xlsx: LOCACION/CIUDAD, On Premise y Total</span>
+                <span class="file-name" data-file-name="cda">Seleccionar archivo</span>
+              </span>
+              <span class="file-action" aria-hidden="true">Examinar</span>
+              <input
+                id="cda-file"
+                name="cda"
+                type="file"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              />
+            </label>
           </fieldset>
 
-          <div class="settings-grid">
+          <p id="cda-mode-note" class="field-help" hidden>
+            El archivo CDA define el total y las cuotas ON/OFF por LOCACION/CIUDAD; reemplaza el tamaño y el canal de aumento manuales.
+          </p>
+          <div id="manual-settings" class="settings-grid">
             <div class="field-group">
               <label for="sample-size">Muestra total de titulares <span aria-hidden="true">*</span></label>
               <div class="number-field">

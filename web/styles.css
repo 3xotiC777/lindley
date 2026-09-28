@@ -408,6 +408,17 @@ h2 {
   border-radius: 12px;
 }
 
+.settings-grid[hidden] {
+  display: none;
+}
+
+.optional-label {
+  margin-left: 0.45rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
 .fixed-scope {
   display: flex;
   align-items: center;
