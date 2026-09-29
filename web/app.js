@@ -237,7 +237,7 @@ function showResult(summary, files) {
   stats.on.textContent = numberFormatter.format(on);
 
   resultSummary.textContent = reviews
-    ? `Se generaron los dos archivos con ${numberFormatter.format(total)} titulares. La hoja CONTROL CUOTAS contiene ${numberFormatter.format(reviews)} control(es) para revisar.`
+    ? `Se generaron los dos archivos con ${numberFormatter.format(total)} titulares. La hoja CONTROL CUOTAS conserva ${numberFormatter.format(reviews)} advertencias para revisar; no impidieron la descarga.`
     : `Se generaron los dos archivos con ${numberFormatter.format(total)} titulares y los controles terminaron sin novedades.`;
 
   showOnly(resultPanel);

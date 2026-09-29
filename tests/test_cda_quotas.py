@@ -185,16 +185,57 @@ class CdaSelectionTests(unittest.TestCase):
         self.assertEqual(len(alfa_off_selected), 15)
         self.assertFalse(controls["Estado"].eq("REVISAR").any())
 
-    def test_incompatible_route_balance_fails_instead_of_exporting(self):
+    def test_minor_on_route_balance_is_reported_without_blocking_download(self):
         quotas = {
             **self.quotas,
             "CDAALFA": {"name": "CDA ALFA", "ON": 12, "OFF": 15},
             "CDABETA": {"name": "CDA BETA", "ON": 10, "OFF": 18},
         }
         with patch.object(config, "load_lima_quotas", return_value={}):
-            with self.assertRaisesRegex(ValueError, "Titulares especializados por ruta ON"):
+            final, controls = selector_engine.run_selection_process(
+                sample_universe(), self.historical, cda_quotas=quotas,
+            )
+        self.assertEqual(int(final[config.SELECTION_COL].eq("T").sum()), 55)
+        balance = controls.loc[
+            controls["Control"].eq("Titulares especializados por ruta ON (10–30 y balance)")
+            & controls["Estado"].eq("REVISAR")
+        ]
+        self.assertFalse(balance.empty)
+        self.assertTrue(balance["Titulares"].between(10, 30).all())
+        self.assertTrue(balance["Suplentes"].gt(0).all())
+
+    def test_historical_mix_deviation_is_reported_without_blocking_download(self):
+        historical = self.historical.copy()
+        historical["ESTRATEGICA"] = "EG"
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                sample_universe(), historical, cda_quotas=self.quotas,
+            )
+        self.assertEqual(int(final[config.SELECTION_COL].eq("T").sum()), 55)
+        self.assertTrue(controls["Control"].eq("Variación por estrategia (máximo +/- 1 pp)").any())
+        self.assertTrue(controls.loc[
+            controls["Control"].eq("Variación por estrategia (máximo +/- 1 pp)"), "Estado"
+        ].eq("REVISAR").any())
+        self.assertTrue(controls.loc[
+            controls["Control"].eq("Cuota CDA por canal"), "Estado"
+        ].eq("OK").all())
+
+    def test_mandatory_control_still_blocks_cda_download(self):
+        real_build_controls = selector_engine.build_controls
+
+        def mark_mandatory_failure(*args, **kwargs):
+            controls = real_build_controls(*args, **kwargs)
+            mask = controls["Control"].eq("Titán/Titán Plus/Fénix obligatorios")
+            controls.loc[mask, "Estado"] = "REVISAR"
+            controls.loc[mask, "Motivo"] = "Falta un titular obligatorio"
+            return controls
+
+        with patch.object(config, "load_lima_quotas", return_value={}), patch.object(
+            selector_engine, "build_controls", side_effect=mark_mandatory_failure,
+        ):
+            with self.assertRaisesRegex(ValueError, "Titán/Titán Plus/Fénix obligatorios"):
                 selector_engine.run_selection_process(
-                    sample_universe(), self.historical, cda_quotas=quotas,
+                    sample_universe(), self.historical, cda_quotas=self.quotas,
                 )
 
 

@@ -31,6 +31,13 @@ puntos. Los controles identifican cuántos titulares usaron ese apoyo por CDA;
 las demás reglas no cambian. Sin archivo de cuotas CDA, la restricción
 original de rutas OFF permanece vigente.
 
+Con cuotas CDA, una variación del mix histórico superior a +/- 1 punto
+porcentual no impide la descarga: queda marcada como `REVISAR` en `CONTROL
+CUOTAS`. Tampoco la impide una diferencia en el balance exacto entre rutas ON
+si cada ruta sigue entre 10 y 30 titulares especializados y conserva suplentes.
+Las cuotas CDA exactas, los puntos obligatorios y los demás controles críticos
+siguen siendo requisitos para generar los archivos.
+
 Al terminar, entrega:
 
 - `SELECCION_MUESTRA_LINDLEY_RESULTADO.xlsx`;

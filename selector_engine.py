@@ -2268,7 +2268,30 @@ def run_selection_process(
                 f"La cuota {row['Canal']} de {row['CDA']} debe ser {int(row['Objetivo']):,}, "
                 f"pero quedó en {int(row['Titulares']):,}."
             )
-        rule_failures = controls.loc[controls["Estado"].eq("REVISAR")]
+        # The source universe can make the historical +/- 1 pp mix and an
+        # otherwise valid 10–30 ON route's exact balance unattainable. Keep
+        # these findings visible in CONTROL CUOTAS, but do not withhold an
+        # otherwise exact CDA selection from download.
+        advisory_mix = controls["Control"].eq("Variación por estrategia (máximo +/- 1 pp)")
+        route_substitutes = pd.to_numeric(
+            controls.get("Suplentes", pd.Series(np.nan, index=controls.index)), errors="coerce",
+        )
+        advisory_on_balance = (
+            controls["Control"].eq("Titulares especializados por ruta ON (10–30 y balance)")
+            & controls["Motivo"].eq("La ruta no coincide con la distribución especializada balanceada calculada")
+            & pd.to_numeric(controls["Titulares"], errors="coerce").between(
+                int(config.ON_SPECIALIZED_ROUTE_ACTIVE_MIN),
+                int(config.ON_SPECIALIZED_ROUTE_MAX),
+            )
+            & route_substitutes.gt(0)
+        )
+        advisory_city_balance = controls["Control"].eq(
+            "Nivelación de rutas especializadas ON por Nombre"
+        )
+        rule_failures = controls.loc[
+            controls["Estado"].eq("REVISAR")
+            & ~(advisory_mix | advisory_on_balance | advisory_city_balance)
+        ]
         if not rule_failures.empty:
             row = rule_failures.iloc[0]
             location = str(row.get("NOMBRE", "") or row.get("CDA", "")).strip()
