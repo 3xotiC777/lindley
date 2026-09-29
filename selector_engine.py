@@ -28,6 +28,16 @@ def _is_specialized(value) -> bool:
     return str(value).strip().upper() in {"SI", "SÍ", "1", "1.0", "TRUE", "ESPECIALIZADA"}
 
 
+def _lima_source_mask(df: pd.DataFrame) -> pd.Series:
+    """Include unlabeled points in a Lima CDA when enforcing LOC.COM minimums."""
+    source_city = df.get("CDA_ORIG_CITY", df["NOMBRE"])
+    lima = source_city.eq("LIMA")
+    if "CDA_QUOTA_KEY" in df.columns:
+        lima_cdas = set(df.loc[lima, "CDA_QUOTA_KEY"].dropna())
+        lima |= df["CDA_QUOTA_KEY"].isin(lima_cdas)
+    return lima
+
+
 def _segment(value) -> str:
     value = str(value).strip().upper()
     return next((code for code in ("EG", "GR", "ME", "PE") if value.startswith(code)), value)
@@ -92,10 +102,15 @@ def _city_group_bounds(
     lima_quotas: dict[str, int],
     *,
     allow_cda_exception: bool = False,
+    allow_off_route_fallback: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[tuple[str, str], int], dict[tuple[str, str], int]]:
     """Return current capacity and mandatory minimums for every historical/current city."""
     prepared = _prepare(df_elegible, allow_cda_exception=allow_cda_exception)
-    capacity_mask = prepared["_selection_channel"].eq("ON") | prepared["_off_qualified_route"]
+    capacity_mask = (
+        prepared["_selection_channel"].eq("ON")
+        | prepared["_off_qualified_route"]
+        | (allow_off_route_fallback & prepared["_selection_channel"].eq("OFF"))
+    )
     capacity_series = prepared.loc[capacity_mask].groupby(CITY_GROUP).size().astype(int)
     # A route with optional ON candidates must retain at least one non-title so
     # that S1 can be assigned. Account for that reserve before distributing an
@@ -118,7 +133,7 @@ def _city_group_bounds(
     lima = prepared.loc[
         prepared["NOMBRE"].eq("LIMA")
         & prepared["Subcanal2"].eq("OFF")
-        & prepared["_off_qualified_route"]
+        & (prepared["_off_qualified_route"] | allow_off_route_fallback)
     ]
     if not lima.empty:
         quota_locations = set(lima_quotas)
@@ -401,7 +416,8 @@ def _fill_city_total(
 
     fill_remaining(primary_mask, within_band=True)
     # Use a secondary universe only when the caller explicitly provides one.
-    # OFF passes no fallback, so it never leaves qualified Titán/Fénix routes.
+    # CDA quotas may use unqualified OFF routes after qualified routes cannot
+    # complete the target within the historical strategy mix.
     if fallback_mask is not None:
         fill_remaining(fallback_mask, within_band=True)
 
@@ -413,24 +429,34 @@ def _fill_city_total(
         fill_remaining(fallback_mask, within_band=False)
 
 
-def _ensure_lima_minimums(df_off: pd.DataFrame, lima_quotas: dict[str, int]) -> None:
+def _ensure_lima_minimums(
+    df_off: pd.DataFrame, lima_quotas: dict[str, int], *, allow_off_route_fallback: bool = False,
+) -> None:
     """Each Lima locality is a minimum; the city total can add PDVs afterwards."""
-    source_city = df_off.get("CDA_ORIG_CITY", df_off["NOMBRE"])
+    lima_rows = _lima_source_mask(df_off)
     for location, minimum in lima_quotas.items():
         location_mask = (
-            source_city.eq("LIMA")
+            lima_rows
             & df_off["LOC.COM"].eq(location)
-            & df_off["_off_qualified_route"]
         )
         current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
         needed = int(minimum) - current
         if needed > 0:
-            _take(df_off, location_mask, needed)
+            _take(df_off, location_mask & df_off["_off_qualified_route"], needed)
+        if allow_off_route_fallback:
+            current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
+            needed = int(minimum) - current
+            if needed > 0:
+                _take(df_off, location_mask & ~df_off["_off_qualified_route"], needed)
         current = int((location_mask & df_off[config.SELECTION_COL].eq("T")).sum())
         if current < int(minimum):
+            route_description = (
+                "rutas OFF permitidas" if allow_off_route_fallback
+                else "rutas OFF con Titán o Fénix"
+            )
             raise ValueError(
                 f"La cuota mínima de Lima para {location} requiere {int(minimum):,} puntos, "
-                f"pero solo hay {current:,} disponibles en rutas OFF con Titán o Fénix."
+                f"pero solo hay {current:,} disponibles en {route_description}."
             )
 
 
@@ -442,6 +468,7 @@ def select_canal_off(
     preferred_on_routes: set[str] | None = None,
     *,
     allow_cda_exception: bool = False,
+    allow_off_route_fallback: bool = False,
 ) -> pd.DataFrame:
     df_off = _prepare(df_off, allow_cda_exception=allow_cda_exception)
     preferred_on_routes = preferred_on_routes or set()
@@ -450,13 +477,15 @@ def select_canal_off(
     # Rule 1: every Titán, Titán Plus or Fénix > 0 is a mandatory titular.
     # This has priority even if it exceeds a historical city/subchannel quota.
     _set_selected(df_off, df_off.index[df_off["_mandatory"]])
-    _ensure_lima_minimums(df_off, lima_quotas)
+    _ensure_lima_minimums(df_off, lima_quotas, allow_off_route_fallback=allow_off_route_fallback)
 
     off_targets = city_targets[city_targets.index.get_level_values("Subcanal2") != "ON"]
     for (city, subchannel), target in off_targets.items():
         _fill_city_total(
             df_off, city, subchannel, int(target), strategy_targets,
-            df_off["_off_qualified_route"], None, False,
+            df_off["_off_qualified_route"],
+            ~df_off["_off_qualified_route"] if allow_off_route_fallback else None,
+            False,
         )
         actual = int((
             df_off["NOMBRE"].eq(city)
@@ -464,6 +493,11 @@ def select_canal_off(
             & df_off[config.SELECTION_COL].eq("T")
         ).sum())
         if actual != int(target):
+            if allow_off_route_fallback:
+                raise ValueError(
+                    f"La cuota OFF de {city} ({int(target):,}) no cabe en el universo "
+                    f"elegible disponible; solo se pudieron asignar {actual:,}."
+                )
             raise ValueError(
                 f"La cuota OFF de {city} ({int(target):,}) no cabe completamente en rutas "
                 f"que tengan al menos un punto Titán o Fénix; solo se pudieron asignar {actual:,}."
@@ -1649,7 +1683,7 @@ def _select_with_cda_quotas(
         [int(cda_quotas[key][channel]) for key, channel in keys], index=target_index, dtype=int
     )
     _groups, capacity, lower = _city_group_bounds(
-        eligible, targets, {}, allow_cda_exception=True,
+        eligible, targets, {}, allow_cda_exception=True, allow_off_route_fallback=True,
     )
     raw_capacity = eligible.groupby(CITY_GROUP).size()
     problems = []
@@ -1660,9 +1694,10 @@ def _select_with_cda_quotas(
         mandatory = int(lower.get((key, channel), 0))
         name = str(cda_quotas[key]["name"])
         if target > available:
+            capacity_label = "capacidad elegible" if channel == "OFF" else "capacidad según rutas"
             problems.append(
                 f"{name} {channel}: cuota {target:,}, elegibles {raw_available:,}, "
-                f"capacidad según rutas {available:,}"
+                f"{capacity_label} {available:,}"
             )
         elif target < mandatory:
             problems.append(f"{name} {channel}: cuota {target:,}, obligatorios {mandatory:,}")
@@ -1698,6 +1733,7 @@ def _select_with_cda_quotas(
         eligible.loc[~on_mask], targets, strategy_targets, lima_quotas,
         preferred_on_routes=on_routes,
         allow_cda_exception=True,
+        allow_off_route_fallback=True,
     )
     selected_on["_CANAL_SELECCION"] = "ON"
     selected_off["_CANAL_SELECCION"] = "OFF"
@@ -1837,8 +1873,9 @@ def build_controls(
             "Motivo": "Meta cercana a 50/50; el total histórico tiene prioridad",
         })
 
+    lima_rows = _lima_source_mask(final)
     for location, minimum in lima_quotas.items():
-        actual = int((selected["NOMBRE"].eq("LIMA") & selected["Subcanal2"].ne("ON") & selected["LOC.COM"].eq(location)).sum())
+        actual = int((lima_rows & final["_CANAL_SELECCION"].eq("OFF") & final[config.SELECTION_COL].eq("T") & final["LOC.COM"].eq(location)).sum())
         rows.append({
             "Control": "Mínimo Lima por LOC.COM", "Canal": "OFF", "NOMBRE": "LIMA", "Subcanal2": "OFF",
             "ESTRATEGICA": "", "LOC.COM": location, "Objetivo": int(minimum), "Titulares": actual,
@@ -2125,36 +2162,38 @@ def build_controls(
         ].astype(str)
     )
     selected_or_substitute = off[config.SELECTION_COL].isin(["T", "S1", "S2", "S3"])
-    exempt_off = (
-        off["CDA_OFF_ROUTE_EXCEPTION"].fillna(False).astype(bool)
-        if cda_quotas is not None and "CDA_OFF_ROUTE_EXCEPTION" in off.columns
-        else pd.Series(False, index=off.index)
-    )
     unqualified = ~off["RUT.COM"].astype(str).isin(qualified_routes)
-    invalid_off_selections = int((selected_or_substitute & unqualified & ~exempt_off).sum())
-    exception_selections = int((selected_or_substitute & unqualified & exempt_off).sum())
+    fallback_titles = off[config.SELECTION_COL].eq("T") & unqualified
+    fallback_substitutes = selected_or_substitute & ~off[config.SELECTION_COL].eq("T") & unqualified
+    fallback_title_count = int(fallback_titles.sum())
+    fallback_substitute_count = int(fallback_substitutes.sum())
+    cda_mode = cda_quotas is not None
     rows.append({
-        "Control": "Selecciones OFF solo en rutas Titán/Fénix", "Canal": "OFF", "NOMBRE": "VARIOS", "Subcanal2": "",
-        "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0, "Titulares": invalid_off_selections,
-        "Diferencia": invalid_off_selections, "Estado": "OK" if invalid_off_selections == 0 else "REVISAR",
+        "Control": "Apoyo OFF en rutas sin Titán/Fénix para cuota CDA" if cda_mode else "Selecciones OFF solo en rutas Titán/Fénix",
+        "Canal": "OFF", "NOMBRE": "VARIOS", "Subcanal2": "",
+        "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0, "Titulares": fallback_title_count,
+        "Diferencia": fallback_title_count,
+        "Estado": ("INFORMATIVO" if fallback_title_count or fallback_substitute_count else "OK") if cda_mode else ("OK" if fallback_title_count == 0 and fallback_substitute_count == 0 else "REVISAR"),
         "Motivo": (
-            f"{exception_selections} selecciones usan la excepción CDA sin Titán/Fénix; las demás están en rutas calificadas"
-            if invalid_off_selections == 0 and exception_selections
+            f"{fallback_title_count} titulares y {fallback_substitute_count} suplentes usan rutas sin Titán/Fénix para completar cuotas CDA; las rutas calificadas tienen prioridad"
+            if cda_mode and (fallback_title_count or fallback_substitute_count)
             else "Todas las selecciones OFF pertenecen a rutas calificadas"
-            if invalid_off_selections == 0
-            else "Hay titulares o suplentes OFF en rutas sin Titán/Fénix fuera de la excepción CDA"
+            if fallback_title_count == 0 and fallback_substitute_count == 0
+            else "Hay titulares o suplentes OFF en rutas sin Titán/Fénix"
         ),
     })
-    if cda_quotas is not None:
-        for key in sorted(set(off.loc[selected_or_substitute & unqualified & exempt_off, "CDA_QUOTA_KEY"])):
-            group = off["CDA_QUOTA_KEY"].eq(key) & selected_or_substitute & unqualified & exempt_off
+    if cda_mode:
+        for key in sorted(set(off.loc[selected_or_substitute & unqualified, "CDA_QUOTA_KEY"])):
+            group = off["CDA_QUOTA_KEY"].eq(key) & unqualified
+            title_count = int((group & fallback_titles).sum())
+            substitute_count = int((group & fallback_substitutes).sum())
             rows.append({
-                "Control": "Excepción OFF sin Titán/Fénix por CDA", "Canal": "OFF",
+                "Control": "Apoyo OFF sin Titán/Fénix por CDA", "Canal": "OFF",
                 "NOMBRE": "", "Subcanal2": "OFF", "CDA": str(cda_quotas[key]["name"]),
                 "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0,
-                "Titulares": int(group.sum()), "Diferencia": int(group.sum()),
+                "Titulares": title_count, "Diferencia": title_count,
                 "Estado": "INFORMATIVO",
-                "Motivo": "Este CDA no tiene puntos Titán/Fénix elegibles; se mantiene su cuota OFF y las demás reglas",
+                "Motivo": f"Se usaron {title_count} titulares y {substitute_count} suplentes en rutas sin Titán/Fénix para completar la cuota OFF",
             })
     return pd.DataFrame(rows)
 

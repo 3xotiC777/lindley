@@ -23,12 +23,13 @@ Si se adjuntan cuotas por CDA, las columnas `LOCACION/CIUDAD`, `On Premise` y
 `Total` determinan toda la muestra: ON = `On Premise`, OFF = `Total - On Premise`.
 La página cruza el CDA con `DES LOC_COM` del universo y toma el total de la
 suma de las filas, sin usar el tamaño ni el canal de aumento manuales. Una
-cuota que no cabe en el universo elegible o en las rutas permitidas produce un
-error con el CDA afectado; no se redistribuye silenciosamente a otro CDA.
-Solo para este modo, si un CDA con cuota OFF no tiene ningún Titán ni Fénix
-elegible, se permite seleccionar en sus rutas OFF sin ese requisito. Si el CDA
-tiene al menos uno, la restricción de rutas sigue vigente. El control de cuotas
-identifica las excepciones aplicadas; las demás reglas no cambian.
+cuota que no cabe en el universo elegible produce un error con el CDA
+afectado; no se redistribuye silenciosamente a otro CDA. En este modo, las
+rutas OFF con Titán o Fénix tienen prioridad. Si no bastan para cumplir la
+cuota CDA y el mix, se completan titulares y suplentes en rutas OFF sin esos
+puntos. Los controles identifican cuántos titulares usaron ese apoyo por CDA;
+las demás reglas no cambian. Sin archivo de cuotas CDA, la restricción
+original de rutas OFF permanece vigente.
 
 Al terminar, entrega:
 

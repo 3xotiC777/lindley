@@ -61,7 +61,7 @@ class CdaSelectionTests(unittest.TestCase):
         self.assertEqual(len(selected), 55)
         self.assertNotIn("S4", set(final[config.SELECTION_COL]))
         self.assertEqual(
-            int(controls.loc[controls["Control"].eq("Selecciones OFF solo en rutas Titán/Fénix"), "Titulares"].iloc[0]), 0,
+            int(controls.loc[controls["Control"].eq("Apoyo OFF en rutas sin Titán/Fénix para cuota CDA"), "Titulares"].iloc[0]), 0,
         )
         self.assertTrue(controls.loc[controls["Control"].eq("Cuota CDA por canal"), "Estado"].eq("OK").all())
         self.assertFalse(controls["Estado"].eq("REVISAR").any())
@@ -87,22 +87,66 @@ class CdaSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(int(off_alfa[config.SELECTION_COL].eq("T").sum()), 15)
         self.assertTrue(off_alfa[config.SELECTION_COL].isin(["S1", "S2", "S3"]).any())
-        exceptions = controls.loc[controls["Control"].eq("Excepción OFF sin Titán/Fénix por CDA")]
+        exceptions = controls.loc[controls["Control"].eq("Apoyo OFF sin Titán/Fénix por CDA")]
         self.assertEqual(exceptions["CDA"].tolist(), ["CDA ALFA"])
         self.assertFalse(controls["Estado"].eq("REVISAR").any())
         self.assertNotIn("CDA_OFF_ROUTE_EXCEPTION", final.columns)
 
-    def test_cda_with_one_fenix_cannot_use_exception_on_other_routes(self):
+    def test_cda_with_one_fenix_uses_unqualified_routes_only_for_remaining_quota(self):
         universe = sample_universe()
         alfa_off = universe.loc[
             universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")
         ].index
         universe.loc[alfa_off[10:], "RUT.COM"] = "CDA ALFA-OFF-UNQUALIFIED"
         with patch.object(config, "load_lima_quotas", return_value={}):
-            with self.assertRaisesRegex(ValueError, "CDA ALFA OFF: cuota 15, elegibles 35, capacidad según rutas 10"):
-                selector_engine.run_selection_process(
-                    universe, self.historical, cda_quotas=self.quotas,
-                )
+            final, controls = selector_engine.run_selection_process(
+                universe, self.historical, cda_quotas=self.quotas,
+            )
+        alfa_titles = final.loc[
+            final["DES LOC_COM"].eq("CDA ALFA")
+            & final["_CANAL_SELECCION"].eq("OFF")
+            & final[config.SELECTION_COL].eq("T")
+        ]
+        self.assertEqual(int(alfa_titles["RUT.COM"].eq("CDA ALFA-OFF").sum()), 10)
+        self.assertEqual(int(alfa_titles["RUT.COM"].eq("CDA ALFA-OFF-UNQUALIFIED").sum()), 5)
+        support = controls.loc[controls["Control"].eq("Apoyo OFF sin Titán/Fénix por CDA")]
+        self.assertEqual(support["CDA"].tolist(), ["CDA ALFA"])
+        self.assertEqual(int(support["Titulares"].iloc[0]), 5)
+        self.assertFalse(controls["Estado"].eq("REVISAR").any())
+
+    def test_qualified_routes_suffice_without_using_fallback(self):
+        universe = sample_universe()
+        alfa_off = universe.loc[
+            universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")
+        ].index
+        universe.loc[alfa_off[20:], "RUT.COM"] = "CDA ALFA-OFF-UNQUALIFIED"
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                universe, self.historical, cda_quotas=self.quotas,
+            )
+        alfa_titles = final.loc[
+            final["DES LOC_COM"].eq("CDA ALFA")
+            & final["_CANAL_SELECCION"].eq("OFF")
+            & final[config.SELECTION_COL].eq("T")
+        ]
+        self.assertTrue(alfa_titles["RUT.COM"].eq("CDA ALFA-OFF").all())
+        self.assertFalse(controls["Control"].eq("Apoyo OFF sin Titán/Fénix por CDA").any())
+
+    def test_lima_minimum_counts_unlabeled_points_in_same_cda(self):
+        universe = sample_universe().iloc[:3].copy()
+        universe["NOMBRE"] = "78MARTINEZVENTANILLA"
+        universe["CDA_ORIG_CITY"] = ["LIMA", "nan", "LIMA"]
+        universe["CDA_QUOTA_KEY"] = "78MARTINEZVENTANILLA"
+        universe["Subcanal2"] = "OFF"
+        universe["CANAL"] = "OFF"
+        universe["LOC.COM"] = "78H"
+        universe["Fenix"] = [1, 1, 0]
+        prepared = selector_engine._prepare(universe)
+        selector_engine._set_selected(prepared, prepared.index[prepared["_mandatory"]])
+        selector_engine._ensure_lima_minimums(
+            prepared, {"78H": 2}, allow_off_route_fallback=True,
+        )
+        self.assertEqual(int(prepared[config.SELECTION_COL].eq("T").sum()), 2)
 
     def test_default_off_mode_ignores_exception_column_from_input(self):
         universe = sample_universe()
@@ -121,7 +165,7 @@ class CdaSelectionTests(unittest.TestCase):
                 universe, targets, strategy_targets, {},
             )
 
-    def test_on_fenix_in_cda_also_prevents_off_exception(self):
+    def test_on_fenix_in_cda_does_not_block_off_quota_fallback(self):
         universe = sample_universe()
         alfa_off = universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")
         alfa_on = universe.loc[
@@ -130,10 +174,16 @@ class CdaSelectionTests(unittest.TestCase):
         universe.loc[alfa_off, "Fenix"] = 0
         universe.loc[alfa_on[0], "Fenix"] = 1
         with patch.object(config, "load_lima_quotas", return_value={}):
-            with self.assertRaisesRegex(ValueError, "CDA ALFA OFF: cuota 15, elegibles 35, capacidad según rutas 0"):
-                selector_engine.run_selection_process(
-                    universe, self.historical, cda_quotas=self.quotas,
-                )
+            final, controls = selector_engine.run_selection_process(
+                universe, self.historical, cda_quotas=self.quotas,
+            )
+        alfa_off_selected = final.loc[
+            final["DES LOC_COM"].eq("CDA ALFA")
+            & final["_CANAL_SELECCION"].eq("OFF")
+            & final[config.SELECTION_COL].eq("T")
+        ]
+        self.assertEqual(len(alfa_off_selected), 15)
+        self.assertFalse(controls["Estado"].eq("REVISAR").any())
 
     def test_incompatible_route_balance_fails_instead_of_exporting(self):
         quotas = {
