@@ -637,6 +637,30 @@ h2 {
   line-height: 1.55;
 }
 
+.quota-warning {
+  margin-top: 18px;
+  padding: 14px 16px;
+  color: #783025;
+  background: var(--danger-soft);
+  border: 1px solid rgba(163, 58, 43, 0.28);
+  border-radius: var(--radius-sm);
+}
+
+.quota-warning[hidden] {
+  display: none;
+}
+
+.quota-warning strong {
+  font-size: 0.84rem;
+}
+
+.quota-warning p {
+  margin: 6px 0 0;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .result-stats {
   display: flex;
   flex-wrap: wrap;

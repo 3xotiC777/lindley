@@ -96,6 +96,12 @@ def run_browser_selection(
         controls["Control"].eq("Titán/Fénix sin NOMBRE por CDA"), "Titulares"
     ]
     mandatory_unnamed_total = int(unnamed_mandatory.sum())
+    quota_warning_rows = controls.loc[
+        controls["Control"].eq("Muestra total solicitada")
+        & controls["Motivo"].astype(str).str.startswith("Las cuotas CDA no caben en el universo"),
+        "Motivo",
+    ]
+    quota_warning = str(quota_warning_rows.iloc[0]) if not quota_warning_rows.empty else ""
 
     if not config.OUTPUT_SELECCION_PATH.is_file() or not config.OUTPUT_DEF_SUP_PATH.is_file():
         raise RuntimeError("El cálculo terminó, pero no fue posible crear los dos archivos de salida.")
@@ -108,6 +114,7 @@ def run_browser_selection(
         "increaseScope": "CUOTAS CDA" if cda_quotas is not None else increase_scope,
         "controlsReview": controls_review,
         "mandatoryUnnamedTotal": mandatory_unnamed_total,
+        "quotaWarning": quota_warning,
         "selectionFile": config.OUTPUT_SELECCION_PATH.name,
         "supervisionFile": config.OUTPUT_DEF_SUP_PATH.name,
     }

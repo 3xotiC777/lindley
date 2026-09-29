@@ -1650,7 +1650,7 @@ def _select_with_cda_quotas(
     historical_strategy_targets: pd.Series,
     cda_quotas: dict[str, dict[str, int | str]],
     lima_quotas: dict[str, int],
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> tuple[pd.DataFrame, pd.Series, str]:
     """Use the existing route selectors with CDA quotas as their group targets."""
     if "DES LOC_COM" not in df_elegible.columns:
         raise ValueError("El universo no contiene la columna DES LOC_COM para aplicar cuotas CDA.")
@@ -1661,6 +1661,7 @@ def _select_with_cda_quotas(
     eligible["_CDA_CHANNEL"] = np.where(
         eligible["Subcanal2"].eq("ON") | eligible["CANAL"].eq("ON"), "ON", "OFF"
     )
+    known_cdas = set(eligible["CDA_QUOTA_KEY"])
     unnamed = ~_has_nombre(eligible["CDA_ORIG_CITY"])
     mandatory = (
         eligible["Programa de Valor"].map(_is_titan)
@@ -1704,36 +1705,48 @@ def _select_with_cda_quotas(
     # unnamed points are excluded; unnamed Titán/Fénix remain mandatory and
     # count inside their own CDA quota.
     raw_capacity = eligible.groupby(CITY_GROUP).size()
-    unnamed_capacity = excluded_no_name.groupby(["CDA_QUOTA_KEY", "_CDA_CHANNEL"]).size()
-    effective_targets = targets.copy()
-    for key, channel in keys:
-        available = int(raw_capacity.get((key, channel), 0))
-        if available < int(targets[(key, channel)]) and int(unnamed_capacity.get((key, channel), 0)) > 0:
-            effective_targets[(key, channel)] = available
-    _groups, capacity, lower = _city_group_bounds(
-        eligible, effective_targets, {}, allow_cda_exception=True, allow_off_route_fallback=True,
+    _groups, capacity, _lower = _city_group_bounds(
+        eligible, targets, {}, allow_cda_exception=True, allow_off_route_fallback=True,
     )
-    problems = []
+    mandatory_counts = prepared.loc[prepared["_mandatory"]].groupby(
+        ["CDA_QUOTA_KEY", "_CDA_CHANNEL"]
+    ).size()
+    effective_targets = targets.copy()
+    capacity_problems = []
+    fatal_problems = []
     for key, channel in keys:
-        target = int(effective_targets[(key, channel)])
+        target = int(targets[(key, channel)])
         available = int(capacity.get((key, channel), 0))
         raw_available = int(raw_capacity.get((key, channel), 0))
-        mandatory = int(lower.get((key, channel), 0))
+        mandatory = int(mandatory_counts.get((key, channel), 0))
         name = str(cda_quotas[key]["name"])
-        if target > available:
+        if target > 0 and key not in known_cdas:
+            fatal_problems.append(f"{name} {channel}: el CDA no existe en el universo")
+        elif target < mandatory:
+            fatal_problems.append(f"{name} {channel}: cuota {target:,}, obligatorios {mandatory:,}")
+        elif available < mandatory:
+            fatal_problems.append(
+                f"{name} {channel}: capacidad según rutas {available:,}, obligatorios {mandatory:,}"
+            )
+        elif target > available:
             capacity_label = "capacidad elegible" if channel == "OFF" else "capacidad según rutas"
-            problems.append(
+            capacity_problems.append(
                 f"{name} {channel}: cuota {target:,}, elegibles {raw_available:,}, "
                 f"{capacity_label} {available:,}"
             )
-        elif target < mandatory:
-            problems.append(f"{name} {channel}: cuota {target:,}, obligatorios {mandatory:,}")
-    if problems:
+            effective_targets[(key, channel)] = available
+    if fatal_problems:
         raise ValueError(
-            "Las cuotas CDA no caben en el universo y las reglas de rutas. "
-            + "; ".join(problems[:6])
-            + (f"; y {len(problems) - 6} CDA/canales más" if len(problems) > 6 else "")
+            "Las cuotas CDA no permiten aplicar las reglas obligatorias. "
+            + "; ".join(fatal_problems[:6])
+            + (f"; y {len(fatal_problems) - 6} CDA/canales más" if len(fatal_problems) > 6 else "")
         )
+    quota_warning = (
+        "Las cuotas CDA no caben en el universo y las reglas de rutas. "
+        + "; ".join(capacity_problems[:6])
+        + (f"; y {len(capacity_problems) - 6} CDA/canales más" if len(capacity_problems) > 6 else "")
+        if capacity_problems else ""
+    )
 
     # Each CDA inherits the historical strategy proportions of its principal
     # city. The existing selectors then enforce route and substitute rules
@@ -1768,7 +1781,7 @@ def _select_with_cda_quotas(
     final = pd.concat([selected_off, selected_on, excluded], ignore_index=True)
     final["_EXCLUDED_NO_NAME"] = final["_EXCLUDED_NO_NAME"].fillna(False).astype(bool)
     final["NOMBRE"] = final["CDA_ORIG_CITY"]
-    return final, effective_targets
+    return final, effective_targets, quota_warning
 
 
 def build_controls(
@@ -1781,6 +1794,7 @@ def build_controls(
     increase_scope: str,
     cda_quotas: dict[str, dict[str, int | str]] | None = None,
     effective_cda_targets: pd.Series | None = None,
+    quota_warning: str = "",
 ) -> pd.DataFrame:
     rows = []
     selected = final[final[config.SELECTION_COL].eq("T")].copy()
@@ -1790,7 +1804,10 @@ def build_controls(
         "Control": "Muestra total solicitada", "Canal": "TODOS", "NOMBRE": "VARIOS", "Subcanal2": "",
         "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": int(total_target), "Titulares": actual_total,
         "Diferencia": actual_total - int(total_target), "Estado": "OK" if actual_total == int(total_target) else "REVISAR",
-        "Motivo": "Muestra total cumplida" if actual_total == int(total_target) else "Los mínimos obligatorios o la disponibilidad impiden igualar la muestra",
+        "Motivo": (
+            "Muestra total cumplida" if actual_total == int(total_target) else
+            quota_warning or "Los mínimos obligatorios o la disponibilidad impiden igualar la muestra"
+        ),
     })
     effective_historical = (
         historical_city_targets
@@ -1851,21 +1868,23 @@ def build_controls(
             unnamed = int(unnamed_cda.get((key, channel), 0))
             named_titles = int(selected_named_cda.get((key, channel), 0))
             mandatory_unnamed = int(mandatory_unnamed_cda.get((key, channel), 0))
-            short_by_name = effective < target and actual == effective
+            short_by_capacity = effective < target and actual == effective
             rows.append({
                 "Control": "Cuota CDA por canal", "Canal": channel, "NOMBRE": "", "Subcanal2": channel,
                 "CDA": str(cda_quotas[key]["name"]), "ESTRATEGICA": "", "LOC.COM": "",
                 "Objetivo": target, "Titulares": actual, "Diferencia": actual - target,
                 "Elegibles_con_NOMBRE": named_available, "Excluidos_sin_NOMBRE": unnamed,
+                "Capacidad_seleccionable": effective,
                 "Titulares_con_NOMBRE": named_titles,
                 "Obligatorios_sin_NOMBRE": mandatory_unnamed,
                 "Estado": "OK" if actual == target else "REVISAR",
                 "Motivo": (
                     "Cuota CDA cumplida" if actual == target else
-                    f"Faltan {target - actual}: hay {named_available} elegibles con NOMBRE "
-                    f"y {mandatory_unnamed} obligatorios sin NOMBRE seleccionados; "
-                    f"{unnamed} puntos ordinarios sin NOMBRE fueron excluidos"
-                    if short_by_name else "La cuota CDA no se pudo completar"
+                    f"Faltan {target - actual}: la capacidad seleccionable es {effective} "
+                    f"({named_available} elegibles con NOMBRE, "
+                    f"{mandatory_unnamed} obligatorios sin NOMBRE seleccionados, "
+                    f"{unnamed} puntos ordinarios sin NOMBRE excluidos)"
+                    if short_by_capacity else "La cuota CDA no se pudo completar"
                 ),
             })
             if mandatory_unnamed:
@@ -2303,7 +2322,7 @@ def run_selection_process(
     else:
         requested_total = sum(int(values["ON"]) + int(values["OFF"]) for values in cda_quotas.values())
         increase_scope = "CUOTAS CDA"
-        final, effective_cda_targets = _select_with_cda_quotas(
+        final, effective_cda_targets, quota_warning = _select_with_cda_quotas(
             df_elegible, strategy_targets, cda_quotas, lima_quotas,
         )
         city_targets = final.loc[final[config.SELECTION_COL].eq("T")].groupby(CITY_GROUP).size()
@@ -2335,6 +2354,7 @@ def run_selection_process(
         final, city_targets, historical_city_targets, strategy_targets, lima_quotas,
         requested_total, increase_scope, cda_quotas,
         effective_cda_targets if cda_quotas is not None else None,
+        quota_warning if cda_quotas is not None else "",
     )
     if cda_quotas is not None:
         mismatched = controls.loc[
@@ -2350,8 +2370,7 @@ def run_selection_process(
                 )
         # The source universe can make the historical +/- 1 pp mix and an
         # otherwise valid 10–30 ON route's exact balance unattainable. Keep
-        # these findings visible in CONTROL CUOTAS, but do not withhold an
-        # otherwise exact CDA selection from download.
+        # these findings visible in CONTROL CUOTAS without blocking download.
         advisory_mix = controls["Control"].eq("Variación por estrategia (máximo +/- 1 pp)")
         route_substitutes = pd.to_numeric(
             controls.get("Suplentes", pd.Series(np.nan, index=controls.index)), errors="coerce",
@@ -2368,18 +2387,18 @@ def run_selection_process(
         advisory_city_balance = controls["Control"].eq(
             "Nivelación de rutas especializadas ON por Nombre"
         )
-        advisory_name_shortfall = (
+        advisory_capacity_shortfall = (
             controls["Control"].eq("Muestra total solicitada")
-            & (expected_total < requested_total)
+            & bool(quota_warning)
         ) | (
             controls["Control"].eq("Cuota CDA por canal")
-            & controls["Motivo"].astype(str).str.contains("sin NOMBRE fueron excluidos", regex=False)
+            & bool(quota_warning)
         )
         advisory_unnamed_mandatory = controls["Control"].eq("Titán/Fénix sin NOMBRE por CDA")
         rule_failures = controls.loc[
             controls["Estado"].eq("REVISAR")
             & ~(advisory_mix | advisory_on_balance | advisory_city_balance
-                | advisory_name_shortfall | advisory_unnamed_mandatory)
+                | advisory_capacity_shortfall | advisory_unnamed_mandatory)
         ]
         if not rule_failures.empty:
             row = rule_failures.iloc[0]

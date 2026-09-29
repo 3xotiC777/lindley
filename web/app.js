@@ -9,6 +9,15 @@ const progressPercent = document.querySelector("#progress-percent");
 const progressBar = document.querySelector("#progress-bar");
 const resultPanel = document.querySelector("#result-panel");
 const resultSummary = document.querySelector("#result-summary");
+const quotaWarning = document.createElement("div");
+const quotaWarningTitle = document.createElement("strong");
+const quotaWarningText = document.createElement("p");
+quotaWarning.className = "quota-warning";
+quotaWarning.setAttribute("role", "alert");
+quotaWarningTitle.textContent = "Cuota CDA incompleta · descarga disponible";
+quotaWarning.append(quotaWarningTitle, quotaWarningText);
+quotaWarning.hidden = true;
+resultSummary.after(quotaWarning);
 const errorPanel = document.querySelector("#error-panel");
 const errorMessage = document.querySelector("#error-message");
 const errorDetails = document.querySelector("#error-details");
@@ -234,6 +243,8 @@ function showResult(summary, files) {
   const on = Number(summary?.actualOn || 0);
   const reviews = Number(summary?.controlsReview || 0);
   const unnamedMandatory = Number(summary?.mandatoryUnnamedTotal || 0);
+  quotaWarningText.textContent = String(summary?.quotaWarning || "").trim();
+  quotaWarning.hidden = !quotaWarningText.textContent;
   stats.total.textContent = numberFormatter.format(total);
   stats.off.textContent = numberFormatter.format(off);
   stats.on.textContent = numberFormatter.format(on);
@@ -245,7 +256,7 @@ function showResult(summary, files) {
     resultSummary.textContent += ` ${numberFormatter.format(unnamedMandatory)} titulares Titán/Fénix sin NOMBRE cuentan dentro de las cuotas CDA y están señalados en CONTROL CUOTAS.`;
   }
   if (requested > total) {
-    resultSummary.textContent += ` Faltan ${numberFormatter.format(requested - total)} titulares por CDA sin suficientes puntos seleccionables con NOMBRE; revisa CONTROL CUOTAS.`;
+    resultSummary.textContent += ` Faltan ${numberFormatter.format(requested - total)} titulares porque uno o más CDA no tienen capacidad seleccionable suficiente; revisa CONTROL CUOTAS.`;
   }
 
   showOnly(resultPanel);

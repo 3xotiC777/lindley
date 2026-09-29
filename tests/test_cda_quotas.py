@@ -74,6 +74,50 @@ class CdaSelectionTests(unittest.TestCase):
                     sample_universe(), self.historical, cda_quotas=quotas,
                 )
 
+    def test_insufficient_cda_capacity_keeps_download_and_exact_warning(self):
+        quotas = {
+            **self.quotas,
+            "CDAALFA": {"name": "CDA ALFA", "ON": 11, "OFF": 40},
+        }
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                sample_universe(), self.historical, cda_quotas=quotas,
+            )
+        selected = final.loc[final[config.SELECTION_COL].eq("T")]
+        self.assertEqual(len(selected), 75)
+        alfa = controls.loc[
+            controls["Control"].eq("Cuota CDA por canal")
+            & controls["CDA"].eq("CDA ALFA")
+            & controls["Canal"].eq("OFF")
+        ].iloc[0]
+        self.assertEqual((int(alfa["Objetivo"]), int(alfa["Titulares"])), (40, 35))
+        self.assertEqual(int(alfa["Capacidad_seleccionable"]), 35)
+        self.assertEqual(alfa["Estado"], "REVISAR")
+        total = controls.loc[controls["Control"].eq("Muestra total solicitada")].iloc[0]
+        self.assertEqual((int(total["Objetivo"]), int(total["Titulares"])), (80, 75))
+        self.assertEqual(
+            total["Motivo"],
+            "Las cuotas CDA no caben en el universo y las reglas de rutas. "
+            "CDA ALFA OFF: cuota 40, elegibles 35, capacidad elegible 35",
+        )
+
+    def test_on_route_capacity_shortfall_preserves_substitute_reserve(self):
+        quotas = {
+            **self.quotas,
+            "CDAALFA": {"name": "CDA ALFA", "ON": 30, "OFF": 15},
+        }
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                sample_universe(), self.historical, cda_quotas=quotas,
+            )
+        alfa_on = final.loc[
+            final["DES LOC_COM"].eq("CDA ALFA") & final["_CANAL_SELECCION"].eq("ON")
+        ]
+        self.assertEqual(int(alfa_on[config.SELECTION_COL].eq("T").sum()), 24)
+        self.assertTrue(alfa_on[config.SELECTION_COL].isin(["S1", "S2", "S3"]).any())
+        total = controls.loc[controls["Control"].eq("Muestra total solicitada")].iloc[0]
+        self.assertIn("CDA ALFA ON: cuota 30, elegibles 25, capacidad según rutas 24", total["Motivo"])
+
     def test_blank_nombre_keeps_mandatory_fenix_but_excludes_other_points(self):
         universe = sample_universe()
         blank = universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")

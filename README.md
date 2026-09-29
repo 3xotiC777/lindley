@@ -23,8 +23,11 @@ Si se adjuntan cuotas por CDA, las columnas `LOCACION/CIUDAD`, `On Premise` y
 `Total` determinan toda la muestra: ON = `On Premise`, OFF = `Total - On Premise`.
 La página cruza el CDA con `DES LOC_COM` del universo y toma el total de la
 suma de las filas, sin usar el tamaño ni el canal de aumento manuales. Una
-cuota que no cabe en el universo elegible produce un error con el CDA
-afectado; no se redistribuye silenciosamente a otro CDA. En este modo, las
+cuota que supera la capacidad del universo o de las rutas se completa hasta
+el máximo seleccionable de ese mismo CDA. La página muestra el aviso de
+capacidad junto a las descargas y `CONTROL CUOTAS` conserva la cuota original,
+el resultado y el faltante para revisión comercial; no se redistribuye a otro
+CDA. La descarga no equivale a una aprobación comercial. En este modo, las
 rutas OFF con Titán o Fénix tienen prioridad. Si no bastan para cumplir la
 cuota CDA y el mix, se completan titulares y suplentes en rutas OFF sin esos
 puntos. Los controles identifican cuántos titulares usaron ese apoyo por CDA;
@@ -45,9 +48,10 @@ Con cuotas CDA, una variación del mix histórico superior a +/- 1 punto
 porcentual no impide la descarga: queda marcada como `REVISAR` en `CONTROL
 CUOTAS`. Tampoco la impide una diferencia en el balance exacto entre rutas ON
 si cada ruta sigue entre 10 y 30 titulares especializados y conserva suplentes.
-Las cuotas CDA exactas, salvo un faltante documentado por puntos ordinarios
-sin `NOMBRE`, los puntos obligatorios y los demás controles críticos siguen
-siendo requisitos para generar los archivos.
+Las cuotas CDA exactas, salvo un faltante documentado por capacidad, los
+puntos obligatorios y los demás controles críticos siguen siendo requisitos
+para generar los archivos. Un CDA inexistente en el universo o una cuota
+inferior a sus Titán/Fénix obligatorios todavía impide el cálculo.
 
 Al terminar, entrega:
 
