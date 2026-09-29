@@ -31,12 +31,23 @@ puntos. Los controles identifican cuántos titulares usaron ese apoyo por CDA;
 las demás reglas no cambian. Sin archivo de cuotas CDA, la restricción
 original de rutas OFF permanece vigente.
 
+Con cuotas CDA, `NOMBRE` vacío (`nan`, `0` o celda vacía) excluye los puntos
+ordinarios de la selección. Los Titán/Fénix continúan siendo titulares
+obligatorios aun sin `NOMBRE` y cuentan **dentro**, no además, de la cuota de su
+CDA. `CONTROL CUOTAS` muestra por CDA/canal los titulares con `NOMBRE`, los
+obligatorios sin `NOMBRE` y los puntos ordinarios excluidos. Una fila adicional
+`Titán/Fénix sin NOMBRE por CDA` marca estos casos para revisión, incluido
+Chulucanas. Si al excluir los puntos ordinarios sin `NOMBRE` un CDA ya no tiene
+capacidad suficiente, su faltante queda señalado allí; no se traslada a otro
+CDA ni se inventa una ciudad.
+
 Con cuotas CDA, una variación del mix histórico superior a +/- 1 punto
 porcentual no impide la descarga: queda marcada como `REVISAR` en `CONTROL
 CUOTAS`. Tampoco la impide una diferencia en el balance exacto entre rutas ON
 si cada ruta sigue entre 10 y 30 titulares especializados y conserva suplentes.
-Las cuotas CDA exactas, los puntos obligatorios y los demás controles críticos
-siguen siendo requisitos para generar los archivos.
+Las cuotas CDA exactas, salvo un faltante documentado por puntos ordinarios
+sin `NOMBRE`, los puntos obligatorios y los demás controles críticos siguen
+siendo requisitos para generar los archivos.
 
 Al terminar, entrega:
 

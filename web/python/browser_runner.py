@@ -92,6 +92,10 @@ def run_browser_selection(
         if control_states is not None
         else 0
     )
+    unnamed_mandatory = controls.loc[
+        controls["Control"].eq("Titán/Fénix sin NOMBRE por CDA"), "Titulares"
+    ]
+    mandatory_unnamed_total = int(unnamed_mandatory.sum())
 
     if not config.OUTPUT_SELECCION_PATH.is_file() or not config.OUTPUT_DEF_SUP_PATH.is_file():
         raise RuntimeError("El cálculo terminó, pero no fue posible crear los dos archivos de salida.")
@@ -103,6 +107,7 @@ def run_browser_selection(
         "actualOff": actual_off,
         "increaseScope": "CUOTAS CDA" if cda_quotas is not None else increase_scope,
         "controlsReview": controls_review,
+        "mandatoryUnnamedTotal": mandatory_unnamed_total,
         "selectionFile": config.OUTPUT_SELECCION_PATH.name,
         "supervisionFile": config.OUTPUT_DEF_SUP_PATH.name,
     }

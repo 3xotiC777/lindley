@@ -74,6 +74,52 @@ class CdaSelectionTests(unittest.TestCase):
                     sample_universe(), self.historical, cda_quotas=quotas,
                 )
 
+    def test_blank_nombre_keeps_mandatory_fenix_but_excludes_other_points(self):
+        universe = sample_universe()
+        blank = universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")
+        first, second = universe.index[blank][:2]
+        universe.loc[[first, second], "NOMBRE"] = "nan"
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                universe, self.historical, cda_quotas=self.quotas,
+            )
+        self.assertEqual(final.loc[final["CODIGO"].eq(universe.loc[first, "CODIGO"]), config.SELECTION_COL].iloc[0], "T")
+        self.assertEqual(final.loc[final["CODIGO"].eq(universe.loc[second, "CODIGO"]), config.SELECTION_COL].iloc[0], "NO")
+        selected_without_name = final.loc[
+            final[config.SELECTION_COL].eq("T") & ~selector_engine._has_nombre(final["NOMBRE"])
+        ]
+        self.assertEqual(selected_without_name["CODIGO"].tolist(), [universe.loc[first, "CODIGO"]])
+        self.assertTrue(controls.loc[controls["Control"].eq("Cuota CDA por canal"), "Estado"].eq("OK").all())
+        unnamed_control = controls.loc[
+            controls["Control"].eq("Titán/Fénix sin NOMBRE por CDA")
+        ]
+        self.assertEqual(unnamed_control["CDA"].tolist(), ["CDA ALFA"])
+        self.assertEqual(unnamed_control["Titulares"].tolist(), [1])
+
+    def test_blank_nombre_shortfall_is_visible_without_redistribution(self):
+        universe = sample_universe()
+        alfa_off = universe.index[
+            universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")
+        ]
+        universe.loc[alfa_off[14:], "NOMBRE"] = "nan"
+        with patch.object(config, "load_lima_quotas", return_value={}):
+            final, controls = selector_engine.run_selection_process(
+                universe, self.historical, cda_quotas=self.quotas,
+            )
+        selected = final.loc[final[config.SELECTION_COL].eq("T")]
+        self.assertEqual(len(selected), 54)
+        self.assertTrue(selector_engine._has_nombre(selected["NOMBRE"]).all())
+        alfa_control = controls.loc[
+            controls["Control"].eq("Cuota CDA por canal")
+            & controls["CDA"].eq("CDA ALFA")
+            & controls["Canal"].eq("OFF")
+        ].iloc[0]
+        self.assertEqual((int(alfa_control["Objetivo"]), int(alfa_control["Titulares"])), (15, 14))
+        self.assertEqual(int(alfa_control["Elegibles_con_NOMBRE"]), 14)
+        self.assertEqual(int(alfa_control["Excluidos_sin_NOMBRE"]), 21)
+        self.assertEqual(alfa_control["Estado"], "REVISAR")
+        self.assertIn("sin NOMBRE", alfa_control["Motivo"])
+
     def test_off_cda_without_any_titan_or_fenix_uses_scoped_exception(self):
         universe = sample_universe()
         alfa_off = universe["DES LOC_COM"].eq("CDA ALFA") & universe["Subcanal2"].eq("OFF")

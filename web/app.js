@@ -229,9 +229,11 @@ function showResult(summary, files) {
   }
 
   const total = Number(summary?.actualTotal || 0);
+  const requested = Number(summary?.requestedTotal || 0);
   const off = Number(summary?.actualOff || 0);
   const on = Number(summary?.actualOn || 0);
   const reviews = Number(summary?.controlsReview || 0);
+  const unnamedMandatory = Number(summary?.mandatoryUnnamedTotal || 0);
   stats.total.textContent = numberFormatter.format(total);
   stats.off.textContent = numberFormatter.format(off);
   stats.on.textContent = numberFormatter.format(on);
@@ -239,6 +241,12 @@ function showResult(summary, files) {
   resultSummary.textContent = reviews
     ? `Se generaron los dos archivos con ${numberFormatter.format(total)} titulares. La hoja CONTROL CUOTAS conserva ${numberFormatter.format(reviews)} advertencias para revisar; no impidieron la descarga.`
     : `Se generaron los dos archivos con ${numberFormatter.format(total)} titulares y los controles terminaron sin novedades.`;
+  if (unnamedMandatory) {
+    resultSummary.textContent += ` ${numberFormatter.format(unnamedMandatory)} titulares Titán/Fénix sin NOMBRE cuentan dentro de las cuotas CDA y están señalados en CONTROL CUOTAS.`;
+  }
+  if (requested > total) {
+    resultSummary.textContent += ` Faltan ${numberFormatter.format(requested - total)} titulares por CDA sin suficientes puntos seleccionables con NOMBRE; revisa CONTROL CUOTAS.`;
+  }
 
   showOnly(resultPanel);
   scrollToPanel(resultPanel);

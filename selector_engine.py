@@ -28,6 +28,13 @@ def _is_specialized(value) -> bool:
     return str(value).strip().upper() in {"SI", "SÍ", "1", "1.0", "TRUE", "ESPECIALIZADA"}
 
 
+def _has_nombre(values: pd.Series) -> pd.Series:
+    """A CDA point needs a real NOMBRE; ingest represents empty cells as 'nan'."""
+    return ~values.fillna("").astype(str).str.strip().str.upper().isin(
+        {"", "NAN", "NONE", "NULL", "0"}
+    )
+
+
 def _lima_source_mask(df: pd.DataFrame) -> pd.Series:
     """Include unlabeled points in a Lima CDA when enforcing LOC.COM minimums."""
     source_city = df.get("CDA_ORIG_CITY", df["NOMBRE"])
@@ -1643,7 +1650,7 @@ def _select_with_cda_quotas(
     historical_strategy_targets: pd.Series,
     cda_quotas: dict[str, dict[str, int | str]],
     lima_quotas: dict[str, int],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.Series]:
     """Use the existing route selectors with CDA quotas as their group targets."""
     if "DES LOC_COM" not in df_elegible.columns:
         raise ValueError("El universo no contiene la columna DES LOC_COM para aplicar cuotas CDA.")
@@ -1654,6 +1661,14 @@ def _select_with_cda_quotas(
     eligible["_CDA_CHANNEL"] = np.where(
         eligible["Subcanal2"].eq("ON") | eligible["CANAL"].eq("ON"), "ON", "OFF"
     )
+    unnamed = ~_has_nombre(eligible["CDA_ORIG_CITY"])
+    mandatory = (
+        eligible["Programa de Valor"].map(_is_titan)
+        | pd.to_numeric(eligible["Fenix"], errors="coerce").fillna(0).gt(0)
+    )
+    eligible["_EXCLUDED_NO_NAME"] = unnamed & ~mandatory
+    excluded_no_name = eligible.loc[eligible["_EXCLUDED_NO_NAME"]].copy()
+    eligible = eligible.loc[~eligible["_EXCLUDED_NO_NAME"]].copy()
     prepared = _prepare(eligible)
     uncovered_mandatory = prepared["_mandatory"] & ~prepared["CDA_QUOTA_KEY"].isin(cda_quotas)
     if bool(uncovered_mandatory.any()):
@@ -1674,7 +1689,10 @@ def _select_with_cda_quotas(
         & eligible["_CDA_CHANNEL"].eq("OFF")
     )
 
-    excluded = eligible.loc[~eligible["CDA_QUOTA_KEY"].isin(cda_quotas)].copy()
+    excluded = pd.concat([
+        excluded_no_name,
+        eligible.loc[~eligible["CDA_QUOTA_KEY"].isin(cda_quotas)].copy(),
+    ])
     eligible = eligible.loc[eligible["CDA_QUOTA_KEY"].isin(cda_quotas)].copy()
     eligible["NOMBRE"] = eligible["CDA_QUOTA_KEY"]
     keys = sorted((key, channel) for key in cda_quotas for channel in ("OFF", "ON"))
@@ -1682,13 +1700,22 @@ def _select_with_cda_quotas(
     targets = pd.Series(
         [int(cda_quotas[key][channel]) for key, channel in keys], index=target_index, dtype=int
     )
-    _groups, capacity, lower = _city_group_bounds(
-        eligible, targets, {}, allow_cda_exception=True, allow_off_route_fallback=True,
-    )
+    # Do not transfer a missing quota to a different CDA. Only ordinary
+    # unnamed points are excluded; unnamed Titán/Fénix remain mandatory and
+    # count inside their own CDA quota.
     raw_capacity = eligible.groupby(CITY_GROUP).size()
+    unnamed_capacity = excluded_no_name.groupby(["CDA_QUOTA_KEY", "_CDA_CHANNEL"]).size()
+    effective_targets = targets.copy()
+    for key, channel in keys:
+        available = int(raw_capacity.get((key, channel), 0))
+        if available < int(targets[(key, channel)]) and int(unnamed_capacity.get((key, channel), 0)) > 0:
+            effective_targets[(key, channel)] = available
+    _groups, capacity, lower = _city_group_bounds(
+        eligible, effective_targets, {}, allow_cda_exception=True, allow_off_route_fallback=True,
+    )
     problems = []
     for key, channel in keys:
-        target = int(targets[(key, channel)])
+        target = int(effective_targets[(key, channel)])
         available = int(capacity.get((key, channel), 0))
         raw_available = int(raw_capacity.get((key, channel), 0))
         mandatory = int(lower.get((key, channel), 0))
@@ -1714,8 +1741,7 @@ def _select_with_cda_quotas(
     strategy_values = {}
     for key, channel in keys:
         group = eligible.loc[eligible["NOMBRE"].eq(key) & eligible["_CDA_CHANNEL"].eq(channel)]
-        named = group.loc[group["CDA_ORIG_CITY"].ne("0"), "CDA_ORIG_CITY"]
-        source = named if not named.empty else group["CDA_ORIG_CITY"]
+        source = group.loc[_has_nombre(group["CDA_ORIG_CITY"]), "CDA_ORIG_CITY"]
         city = str(source.value_counts().index[0]) if not source.empty else ""
         for segment in ("EG", "GR", "ME", "PE"):
             strategy_values[(key, channel, segment)] = int(
@@ -1727,10 +1753,10 @@ def _select_with_cda_quotas(
     )
 
     on_mask = eligible["_CDA_CHANNEL"].eq("ON")
-    selected_on = select_canal_on(eligible.loc[on_mask], targets, strategy_targets)
+    selected_on = select_canal_on(eligible.loc[on_mask], effective_targets, strategy_targets)
     on_routes = set(selected_on.loc[selected_on[config.SELECTION_COL].eq("T"), "RUT.COM"].astype(str))
     selected_off = select_canal_off(
-        eligible.loc[~on_mask], targets, strategy_targets, lima_quotas,
+        eligible.loc[~on_mask], effective_targets, strategy_targets, lima_quotas,
         preferred_on_routes=on_routes,
         allow_cda_exception=True,
         allow_off_route_fallback=True,
@@ -1740,8 +1766,9 @@ def _select_with_cda_quotas(
     excluded[config.SELECTION_COL] = "NO"
     excluded["_CANAL_SELECCION"] = excluded["_CDA_CHANNEL"]
     final = pd.concat([selected_off, selected_on, excluded], ignore_index=True)
+    final["_EXCLUDED_NO_NAME"] = final["_EXCLUDED_NO_NAME"].fillna(False).astype(bool)
     final["NOMBRE"] = final["CDA_ORIG_CITY"]
-    return final
+    return final, effective_targets
 
 
 def build_controls(
@@ -1753,6 +1780,7 @@ def build_controls(
     total_target: int,
     increase_scope: str,
     cda_quotas: dict[str, dict[str, int | str]] | None = None,
+    effective_cda_targets: pd.Series | None = None,
 ) -> pd.DataFrame:
     rows = []
     selected = final[final[config.SELECTION_COL].eq("T")].copy()
@@ -1803,16 +1831,57 @@ def build_controls(
 
     if cda_quotas is not None:
         actual_cda = selected.groupby(["CDA_QUOTA_KEY", "_CANAL_SELECCION"]).size()
+        named_cda = final.loc[_has_nombre(final["NOMBRE"])].groupby(
+            ["CDA_QUOTA_KEY", "_CANAL_SELECCION"]
+        ).size()
+        selected_named_cda = selected.loc[_has_nombre(selected["NOMBRE"])].groupby(
+            ["CDA_QUOTA_KEY", "_CANAL_SELECCION"]
+        ).size()
+        mandatory_unnamed_cda = selected.loc[~_has_nombre(selected["NOMBRE"])].groupby(
+            ["CDA_QUOTA_KEY", "_CANAL_SELECCION"]
+        ).size()
+        unnamed_cda = final.loc[final["_EXCLUDED_NO_NAME"]].groupby(
+            ["CDA_QUOTA_KEY", "_CANAL_SELECCION"]
+        ).size()
         for key, channel in sorted((key, channel) for key in cda_quotas for channel in ("OFF", "ON")):
             target = int(cda_quotas[key][channel])
             actual = int(actual_cda.get((key, channel), 0))
+            effective = int(effective_cda_targets.get((key, channel), target)) if effective_cda_targets is not None else target
+            named_available = int(named_cda.get((key, channel), 0))
+            unnamed = int(unnamed_cda.get((key, channel), 0))
+            named_titles = int(selected_named_cda.get((key, channel), 0))
+            mandatory_unnamed = int(mandatory_unnamed_cda.get((key, channel), 0))
+            short_by_name = effective < target and actual == effective
             rows.append({
                 "Control": "Cuota CDA por canal", "Canal": channel, "NOMBRE": "", "Subcanal2": channel,
                 "CDA": str(cda_quotas[key]["name"]), "ESTRATEGICA": "", "LOC.COM": "",
                 "Objetivo": target, "Titulares": actual, "Diferencia": actual - target,
+                "Elegibles_con_NOMBRE": named_available, "Excluidos_sin_NOMBRE": unnamed,
+                "Titulares_con_NOMBRE": named_titles,
+                "Obligatorios_sin_NOMBRE": mandatory_unnamed,
                 "Estado": "OK" if actual == target else "REVISAR",
-                "Motivo": "Cuota CDA cumplida" if actual == target else "La cuota CDA no se pudo completar",
+                "Motivo": (
+                    "Cuota CDA cumplida" if actual == target else
+                    f"Faltan {target - actual}: hay {named_available} elegibles con NOMBRE "
+                    f"y {mandatory_unnamed} obligatorios sin NOMBRE seleccionados; "
+                    f"{unnamed} puntos ordinarios sin NOMBRE fueron excluidos"
+                    if short_by_name else "La cuota CDA no se pudo completar"
+                ),
             })
+            if mandatory_unnamed:
+                rows.append({
+                    "Control": "Titán/Fénix sin NOMBRE por CDA", "Canal": channel,
+                    "NOMBRE": "", "Subcanal2": channel, "CDA": str(cda_quotas[key]["name"]),
+                    "ESTRATEGICA": "", "LOC.COM": "", "Objetivo": 0,
+                    "Titulares": mandatory_unnamed, "Diferencia": mandatory_unnamed,
+                    "Titulares_con_NOMBRE": named_titles,
+                    "Obligatorios_sin_NOMBRE": mandatory_unnamed,
+                    "Estado": "REVISAR",
+                    "Motivo": (
+                        f"{mandatory_unnamed} Titán/Fénix obligatorios sin NOMBRE "
+                        f"cuentan dentro de la cuota CDA; {named_titles} titulares sí tienen NOMBRE"
+                    ),
+                })
 
     actual_city = selected.groupby(CITY_GROUP).size()
     all_city_groups = set(city_targets.index.to_list()) | set(actual_city.index.to_list())
@@ -1985,6 +2054,8 @@ def build_controls(
         })
 
     mandatory = final["Programa de Valor"].map(_is_titan) | pd.to_numeric(final["Fenix"], errors="coerce").fillna(0).gt(0)
+    if cda_quotas is not None:
+        mandatory &= ~final["_EXCLUDED_NO_NAME"]
     mandatory_selected = int((mandatory & final[config.SELECTION_COL].eq("T")).sum())
     mandatory_total = int(mandatory.sum())
     rows.append({
@@ -2127,7 +2198,9 @@ def build_controls(
             final["_CANAL_SELECCION"].eq("OFF") & final[config.SELECTION_COL].eq("T"), "RUT.COM"
         ].astype(str)
     )
-    off_all = final.loc[final["_CANAL_SELECCION"].eq("OFF")]
+    off_all = final.loc[final["_CANAL_SELECCION"].eq("OFF") & (
+        ~final["_EXCLUDED_NO_NAME"] if cda_quotas is not None else True
+    )]
     off_qualified_routes = set(
         off_all.loc[
             off_all["Programa de Valor"].map(_is_titan)
@@ -2153,7 +2226,7 @@ def build_controls(
         ),
     })
 
-    off = final[final["_CANAL_SELECCION"].eq("OFF")]
+    off = off_all
     qualified_routes = set(
         off.loc[
             off["Programa de Valor"].map(_is_titan)
@@ -2230,7 +2303,9 @@ def run_selection_process(
     else:
         requested_total = sum(int(values["ON"]) + int(values["OFF"]) for values in cda_quotas.values())
         increase_scope = "CUOTAS CDA"
-        final = _select_with_cda_quotas(df_elegible, strategy_targets, cda_quotas, lima_quotas)
+        final, effective_cda_targets = _select_with_cda_quotas(
+            df_elegible, strategy_targets, cda_quotas, lima_quotas,
+        )
         city_targets = final.loc[final[config.SELECTION_COL].eq("T")].groupby(CITY_GROUP).size()
     final["SEL_OFF"] = (final["_CANAL_SELECCION"].eq("OFF") & final[config.SELECTION_COL].eq("T")).astype(int)
     final["SEL_ON"] = (final["_CANAL_SELECCION"].eq("ON") & final[config.SELECTION_COL].eq("T")).astype(int)
@@ -2241,12 +2316,14 @@ def run_selection_process(
         final["_CANAL_SELECCION"].eq("ON")
         & final[config.SELECTION_COL].eq("T")
     ).sum())
-    if actual_total != requested_total:
+    expected_total = int(effective_cda_targets.sum()) if cda_quotas is not None else requested_total
+    if actual_total != expected_total:
         raise RuntimeError(
-            f"La muestra debe sumar {requested_total:,} titulares, pero quedó en {actual_total:,}."
+            f"La muestra debe sumar {expected_total:,} titulares seleccionables, "
+            f"pero quedó en {actual_total:,}."
         )
     expected_on = (
-        sum(int(values["ON"]) for values in cda_quotas.values())
+        sum(int(value) for (_key, channel), value in effective_cda_targets.items() if channel == "ON")
         if cda_quotas is not None else
         int(sum(value for (_city, subchannel), value in city_targets.items() if subchannel == "ON"))
     )
@@ -2257,17 +2334,20 @@ def run_selection_process(
     controls = build_controls(
         final, city_targets, historical_city_targets, strategy_targets, lima_quotas,
         requested_total, increase_scope, cda_quotas,
+        effective_cda_targets if cda_quotas is not None else None,
     )
     if cda_quotas is not None:
         mismatched = controls.loc[
             controls["Control"].eq("Cuota CDA por canal") & controls["Estado"].ne("OK")
         ]
-        if not mismatched.empty:
-            row = mismatched.iloc[0]
-            raise RuntimeError(
-                f"La cuota {row['Canal']} de {row['CDA']} debe ser {int(row['Objetivo']):,}, "
-                f"pero quedó en {int(row['Titulares']):,}."
-            )
+        for _index, row in mismatched.iterrows():
+            key = _cda_key(row["CDA"])
+            allowed = int(effective_cda_targets[(key, row["Canal"])])
+            if int(row["Titulares"]) != allowed or allowed >= int(row["Objetivo"]):
+                raise RuntimeError(
+                    f"La cuota {row['Canal']} de {row['CDA']} debe ser {int(row['Objetivo']):,}, "
+                    f"pero quedó en {int(row['Titulares']):,}."
+                )
         # The source universe can make the historical +/- 1 pp mix and an
         # otherwise valid 10–30 ON route's exact balance unattainable. Keep
         # these findings visible in CONTROL CUOTAS, but do not withhold an
@@ -2288,9 +2368,18 @@ def run_selection_process(
         advisory_city_balance = controls["Control"].eq(
             "Nivelación de rutas especializadas ON por Nombre"
         )
+        advisory_name_shortfall = (
+            controls["Control"].eq("Muestra total solicitada")
+            & (expected_total < requested_total)
+        ) | (
+            controls["Control"].eq("Cuota CDA por canal")
+            & controls["Motivo"].astype(str).str.contains("sin NOMBRE fueron excluidos", regex=False)
+        )
+        advisory_unnamed_mandatory = controls["Control"].eq("Titán/Fénix sin NOMBRE por CDA")
         rule_failures = controls.loc[
             controls["Estado"].eq("REVISAR")
-            & ~(advisory_mix | advisory_on_balance | advisory_city_balance)
+            & ~(advisory_mix | advisory_on_balance | advisory_city_balance
+                | advisory_name_shortfall | advisory_unnamed_mandatory)
         ]
         if not rule_failures.empty:
             row = rule_failures.iloc[0]
@@ -2300,7 +2389,10 @@ def run_selection_process(
                 + (f" ({location})" if location else "")
                 + f". {row['Motivo']}"
             )
-        final = final.drop(columns=["CDA_ORIG_CITY", "CDA_QUOTA_KEY", "CDA_OFF_ROUTE_EXCEPTION", "_CDA_CHANNEL"], errors="ignore")
+        final = final.drop(columns=[
+            "CDA_ORIG_CITY", "CDA_QUOTA_KEY", "CDA_OFF_ROUTE_EXCEPTION",
+            "_CDA_CHANNEL", "_EXCLUDED_NO_NAME",
+        ], errors="ignore")
     print(f"Selection complete. Total Titulares: {int(final[config.SELECTION_COL].eq('T').sum())}")
     print(controls["Estado"].value_counts().to_dict())
     return final, controls
