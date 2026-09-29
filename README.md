@@ -25,6 +25,10 @@ La página cruza el CDA con `DES LOC_COM` del universo y toma el total de la
 suma de las filas, sin usar el tamaño ni el canal de aumento manuales. Una
 cuota que no cabe en el universo elegible o en las rutas permitidas produce un
 error con el CDA afectado; no se redistribuye silenciosamente a otro CDA.
+Solo para este modo, si un CDA con cuota OFF no tiene ningún Titán ni Fénix
+elegible, se permite seleccionar en sus rutas OFF sin ese requisito. Si el CDA
+tiene al menos uno, la restricción de rutas sigue vigente. El control de cuotas
+identifica las excepciones aplicadas; las demás reglas no cambian.
 
 Al terminar, entrega:
 
