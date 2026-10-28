@@ -2376,7 +2376,7 @@ def build_controls(
                 "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0,
                 "Titulares": title_count, "Diferencia": title_count,
                 "Estado": "INFORMATIVO",
-                "Motivo": f"Se usaron {title_count} titulares y {substitute_count} suplentes en rutas sin Titán/Fénix para completar la cuota OFF",
+                "Motivo": f"Se usaron {title_count} titulares y {substitute_count} suplentes en rutas sin Titán/Fénix para completar la cuota CDA o mejorar un mix inicialmente desviado más de 5 pp",
             })
     return pd.DataFrame(rows)
 
