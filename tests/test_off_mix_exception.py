@@ -77,5 +77,18 @@ class OffMixExceptionTests(unittest.TestCase):
         result = engine.select_canal_off(pd.DataFrame(rows), pd.Series([20],index=idx), history(0,20), {}, allow_off_route_fallback=True)
         self.assertFalse(result.loc[result[config.SELECTION_COL].eq('T'),'RUT.COM'].eq('UNQUALIFIED').any())
 
+    def test_additional_strategy_is_counted_in_historical_mix(self):
+        frame = engine._prepare(make_tumbes())
+        selected_ids = frame.index[frame['RUT.COM'].ne('UNQUALIFIED')][:20]
+        frame.loc[selected_ids, config.SELECTION_COL] = 'T'
+        frame.loc[selected_ids[:10], '_segment'] = 'GR'
+        frame.loc[selected_ids[10:], '_segment'] = 'EG'
+        candidates = frame.index[frame['RUT.COM'].eq('UNQUALIFIED')][:3]
+        frame.loc[candidates, '_segment'] = 'MI'
+        idx = pd.MultiIndex.from_tuples([('TUMBES','OFF','EG'),('TUMBES','OFF','GR'),('TUMBES','OFF','MI')],names=engine.STRATEGY_GROUP)
+        engine._improve_off_mix_with_route_exception(frame, pd.Series([9,9,2],index=idx), {}, set())
+        selected = frame.loc[frame[config.SELECTION_COL].eq('T'),'_segment'].value_counts().to_dict()
+        self.assertEqual(selected.get('MI'),2)
+
 
 if __name__ == '__main__': unittest.main()
