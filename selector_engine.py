@@ -531,22 +531,20 @@ def _improve_off_mix_with_route_exception(
     preferred_on_routes: set[str] | None = None,
 ) -> None:
     """Open unqualified routes only to improve a mix initially more than 5 pp away."""
-    segments = ("EG", "GR", "ME", "PE")
     preferred_on_routes = preferred_on_routes or set()
     route = df_off["RUT.COM"].astype(str)
     source_city = df_off.get("CDA_ORIG_CITY", df_off["NOMBRE"])
     for (city, subchannel), _group in df_off.groupby(CITY_GROUP, dropna=False):
         mask = df_off["NOMBRE"].eq(city) & df_off["Subcanal2"].eq(subchannel)
         reference = _strategy_targets_for(city, subchannel, strategy_targets)
-        ref_total = sum(reference.get(segment, 0) for segment in segments)
+        ref_total = sum(reference.values())
         selected = mask & df_off[config.SELECTION_COL].eq("T")
         total = int(selected.sum())
         if not ref_total or not total:
             continue
-        # Do not silently reinterpret historical categories outside the four
-        # supported mix categories; those groups require explicit review.
-        if not df_off.loc[selected, "_segment"].isin(segments).all():
-            continue
+        # Include any additional categories, such as MI, in the same mix
+        # calculation rather than hiding their contribution to the denominator.
+        segments = sorted(set(reference) | set(df_off.loc[mask, "_segment"].astype(str)))
         shares = {segment: reference.get(segment, 0) / ref_total for segment in segments}
         counts = df_off.loc[selected, "_segment"].value_counts().to_dict()
 
