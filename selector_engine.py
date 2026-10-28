@@ -491,9 +491,17 @@ def select_canal_off(
         _fill_city_total(
             df_off, city, subchannel, int(target), strategy_targets,
             df_off["_off_qualified_route"],
-            ~df_off["_off_qualified_route"] if allow_off_route_fallback else None,
+            None,
             False,
         )
+        # The CDA quota exception applies only when qualified routes cannot
+        # supply the quota; improving a mix that deviates by over 5 pp is
+        # handled separately by the quota-neutral rebalancing pass below.
+        if allow_off_route_fallback:
+            _fill_city_total(
+                df_off, city, subchannel, int(target), strategy_targets,
+                df_off["_off_qualified_route"], ~df_off["_off_qualified_route"], False,
+            )
         actual = int((
             df_off["NOMBRE"].eq(city)
             & df_off["Subcanal2"].eq(subchannel)
@@ -511,8 +519,82 @@ def select_canal_off(
             )
 
     _rebalance_off_route_overlap(df_off, preferred_on_routes, lima_quotas)
+    _improve_off_mix_with_route_exception(df_off, strategy_targets, lima_quotas, preferred_on_routes)
     _assign_substitutes(df_off)
     return df_off.drop(columns=[column for column in df_off.columns if column.startswith("_")], errors="ignore")
+
+
+def _improve_off_mix_with_route_exception(
+    df_off: pd.DataFrame,
+    strategy_targets: pd.Series,
+    lima_quotas: dict[str, int],
+    preferred_on_routes: set[str] | None = None,
+) -> None:
+    """Open unqualified routes only to improve a mix initially more than 5 pp away."""
+    segments = ("EG", "GR", "ME", "PE")
+    preferred_on_routes = preferred_on_routes or set()
+    route = df_off["RUT.COM"].astype(str)
+    source_city = df_off.get("CDA_ORIG_CITY", df_off["NOMBRE"])
+    for (city, subchannel), _group in df_off.groupby(CITY_GROUP, dropna=False):
+        mask = df_off["NOMBRE"].eq(city) & df_off["Subcanal2"].eq(subchannel)
+        reference = _strategy_targets_for(city, subchannel, strategy_targets)
+        ref_total = sum(reference.get(segment, 0) for segment in segments)
+        selected = mask & df_off[config.SELECTION_COL].eq("T")
+        total = int(selected.sum())
+        if not ref_total or not total:
+            continue
+        # Do not silently reinterpret historical categories outside the four
+        # supported mix categories; those groups require explicit review.
+        if not df_off.loc[selected, "_segment"].isin(segments).all():
+            continue
+        shares = {segment: reference.get(segment, 0) / ref_total for segment in segments}
+        counts = df_off.loc[selected, "_segment"].value_counts().to_dict()
+
+        def distance(values):
+            gaps = [abs(values.get(segment, 0) / total - shares[segment]) * 100 for segment in segments]
+            return (round(max(gaps), 10), round(sum(gaps), 10))
+
+        if distance(counts)[0] <= 5:
+            continue
+        for _ in range(total):
+            current = distance(counts)
+            selected = mask & df_off[config.SELECTION_COL].eq("T")
+            available = mask & df_off[config.SELECTION_COL].eq("NO")
+            incoming = df_off.loc[available & ~df_off["_off_qualified_route"]]
+            outgoing = df_off.loc[selected & ~df_off["_mandatory"]]
+            # Keep a substitute candidate for each newly activated route.
+            available_by_route = df_off.loc[available].groupby(route[available]).size()
+            incoming = incoming.loc[route.loc[incoming.index].map(available_by_route).fillna(0).ge(2)]
+            title_by_route = df_off.loc[selected].groupby(route[selected]).size()
+            outgoing = outgoing.loc[~(
+                route.loc[outgoing.index].isin(preferred_on_routes)
+                & route.loc[outgoing.index].map(title_by_route).fillna(0).le(1)
+            )]
+            if not lima_quotas == {}:
+                for location, minimum in lima_quotas.items():
+                    lima_selected = selected & source_city.eq("LIMA") & df_off["LOC.COM"].eq(location)
+                    if int(lima_selected.sum()) <= int(minimum):
+                        outgoing = outgoing.loc[~(source_city.loc[outgoing.index].eq("LIMA") & outgoing["LOC.COM"].eq(location))]
+            best = None
+            for old in segments:
+                old_rows = outgoing.loc[outgoing["_segment"].eq(old)]
+                if old_rows.empty:
+                    continue
+                for new in segments:
+                    new_rows = incoming.loc[incoming["_segment"].eq(new)]
+                    if old == new or new_rows.empty:
+                        continue
+                    trial = dict(counts)
+                    trial[old] = trial.get(old, 0) - 1
+                    trial[new] = trial.get(new, 0) + 1
+                    score = distance(trial)
+                    if score < current and (best is None or score < best[0]):
+                        best = (score, _rank(old_rows).index[-1], _rank(new_rows).index[0], trial)
+            if best is None:
+                break
+            _, old_index, new_index, counts = best
+            df_off.loc[old_index, config.SELECTION_COL] = "NO"
+            df_off.loc[new_index, config.SELECTION_COL] = "T"
 
 
 def _rebalance_off_route_overlap(
@@ -2261,19 +2343,30 @@ def build_controls(
     fallback_substitute_count = int(fallback_substitutes.sum())
     cda_mode = cda_quotas is not None
     rows.append({
-        "Control": "Apoyo OFF en rutas sin Titán/Fénix para cuota CDA" if cda_mode else "Selecciones OFF solo en rutas Titán/Fénix",
+        "Control": "Apoyo OFF en rutas sin Titán/Fénix para cuota CDA" if cda_mode else "Excepción OFF por mix mayor a 5 pp",
         "Canal": "OFF", "NOMBRE": "VARIOS", "Subcanal2": "",
         "ESTRATEGICA": "T/S1/S2/S3", "LOC.COM": "", "Objetivo": 0, "Titulares": fallback_title_count,
         "Diferencia": fallback_title_count,
-        "Estado": ("INFORMATIVO" if fallback_title_count or fallback_substitute_count else "OK") if cda_mode else ("OK" if fallback_title_count == 0 and fallback_substitute_count == 0 else "REVISAR"),
+        "Estado": "INFORMATIVO" if fallback_title_count or fallback_substitute_count else "OK",
         "Motivo": (
-            f"{fallback_title_count} titulares y {fallback_substitute_count} suplentes usan rutas sin Titán/Fénix para completar cuotas CDA; las rutas calificadas tienen prioridad"
+            f"{fallback_title_count} titulares y {fallback_substitute_count} suplentes usan rutas sin Titán/Fénix para completar cuotas CDA o mejorar un mix inicialmente desviado más de 5 pp; las rutas calificadas tienen prioridad"
             if cda_mode and (fallback_title_count or fallback_substitute_count)
             else "Todas las selecciones OFF pertenecen a rutas calificadas"
             if fallback_title_count == 0 and fallback_substitute_count == 0
-            else "Hay titulares o suplentes OFF en rutas sin Titán/Fénix"
+            else f"{fallback_title_count} titulares y {fallback_substitute_count} suplentes en rutas sin Titán/Fénix para acercar el mix histórico"
         ),
     })
+    if not cda_mode:
+        for city, group in off.loc[selected_or_substitute & unqualified].groupby("NOMBRE", dropna=False):
+            titles = int(group[config.SELECTION_COL].eq("T").sum())
+            substitutes = int(group[config.SELECTION_COL].isin(["S1", "S2", "S3"]).sum())
+            rows.append({
+                "Control": "Excepción OFF por mix: detalle por NOMBRE",
+                "Canal": "OFF", "NOMBRE": city, "Subcanal2": "OFF", "ESTRATEGICA": "T/S1/S2/S3",
+                "Objetivo": 0, "Titulares": titles, "Diferencia": titles,
+                "Estado": "INFORMATIVO",
+                "Motivo": f"{titles} titulares y {substitutes} suplentes en rutas sin Titán/Fénix para acercar el mix histórico inicialmente desviado más de 5 pp",
+            })
     if cda_mode:
         for key in sorted(set(off.loc[selected_or_substitute & unqualified, "CDA_QUOTA_KEY"])):
             group = off["CDA_QUOTA_KEY"].eq(key) & unqualified
