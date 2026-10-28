@@ -1,3 +1,5 @@
+import { readSelectedFile } from "./file-reader.mjs";
+
 const form = document.querySelector("#selector-form");
 const workspace = document.querySelector(".workspace");
 const runButton = document.querySelector("#run-button");
@@ -293,12 +295,10 @@ async function startSelection({ sampleSize, useCda }) {
     const previous = inputs.previous.files[0];
     const lima = inputs.lima.files[0];
     const cda = inputs.cda.files?.[0];
-    const [preselectionBuffer, previousBuffer, limaBuffer, cdaBuffer] = await Promise.all([
-      preselection.arrayBuffer(),
-      previous.arrayBuffer(),
-      lima.arrayBuffer(),
-      cda?.arrayBuffer(),
-    ]);
+    const preselectionBuffer = await readSelectedFile(preselection, "preselection");
+    const previousBuffer = await readSelectedFile(previous, "previous");
+    const limaBuffer = await readSelectedFile(lima, "lima");
+    const cdaBuffer = useCda ? await readSelectedFile(cda, "cda") : null;
 
     const increaseScope = form.querySelector('input[name="increaseScope"]:checked')?.value || "OFF";
     const transferables = [preselectionBuffer, previousBuffer, limaBuffer];
@@ -321,7 +321,24 @@ async function startSelection({ sampleSize, useCda }) {
       transferables,
     );
   } catch (error) {
-    showFailure("No fue posible leer uno de los archivos seleccionados.", error?.stack || String(error));
+    if (error.fileInputKey) {
+      const key = error.fileInputKey;
+      inputs[key].value = "";
+      inputs[key].setAttribute("aria-invalid", "true");
+      const card = document.querySelector(`[data-file-card="${key}"]`);
+      card.classList.remove("has-file");
+      card.classList.add("has-error");
+      document.querySelector(`[data-file-name="${key}"]`).textContent = "Vuelve a seleccionar este archivo";
+      if (key === "cda") {
+        manualSettings.hidden = false;
+        cdaModeNote.hidden = true;
+        sampleSizeInput.required = true;
+      }
+    }
+    showFailure(
+      error.fileInputKey ? error.message : "No fue posible iniciar el motor de selección. Vuelve a intentar o revisa el detalle técnico.",
+      [error?.stack || String(error), error?.cause?.stack || String(error?.cause || "")].filter(Boolean).join("\n\n"),
+    );
   }
 }
 
