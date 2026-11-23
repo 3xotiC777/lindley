@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict, deque
 import math
 import re
 import unicodedata
@@ -476,6 +476,7 @@ def select_canal_off(
     *,
     allow_cda_exception: bool = False,
     allow_off_route_fallback: bool = False,
+    city_strategy_targets: pd.Series | None = None,
 ) -> pd.DataFrame:
     df_off = _prepare(df_off, allow_cda_exception=allow_cda_exception)
     preferred_on_routes = preferred_on_routes or set()
@@ -520,6 +521,7 @@ def select_canal_off(
 
     _rebalance_off_route_overlap(df_off, preferred_on_routes, lima_quotas)
     _improve_off_mix_with_route_exception(df_off, strategy_targets, lima_quotas, preferred_on_routes)
+    _prioritize_eg_gr_titles(df_off, strategy_targets, city_strategy_targets, lima_quotas)
     _assign_substitutes(df_off)
     return df_off.drop(columns=[column for column in df_off.columns if column.startswith("_")], errors="ignore")
 
@@ -748,7 +750,13 @@ def _select_on_route_specialized_targets(
     return all_targets
 
 
-def select_canal_on(df_on: pd.DataFrame, city_targets: pd.Series, strategy_targets: pd.Series) -> pd.DataFrame:
+def select_canal_on(
+    df_on: pd.DataFrame,
+    city_targets: pd.Series,
+    strategy_targets: pd.Series,
+    *,
+    city_strategy_targets: pd.Series | None = None,
+) -> pd.DataFrame:
     df_on = _prepare(df_on)
     # Rule 1 also applies to ON before any quota completion.
     _set_selected(df_on, df_on.index[df_on["_mandatory"]])
@@ -770,6 +778,7 @@ def select_canal_on(df_on: pd.DataFrame, city_targets: pd.Series, strategy_targe
     _concentrate_on_non_specialized_titles(df_on, route_targets)
     _ensure_on_route_substitute_capacity(df_on)
     _rebalance_on_strategy_within_routes(df_on, strategy_targets)
+    _prioritize_eg_gr_titles(df_on, strategy_targets, city_strategy_targets)
     for (city, subchannel), target in on_targets.items():
         actual = int((
             df_on["NOMBRE"].eq(city)
@@ -1668,6 +1677,97 @@ def _balanced_on_route_targets(
     return targets
 
 
+def _title_mix_state(titles: pd.DataFrame, name_column: str, historical: pd.Series) -> dict:
+    """Track current title counts and historical counts by name and subchannel."""
+    if historical.empty:
+        return {}
+    historical_mix = {
+        key: (group.droplevel([0, 1]).to_dict(), int(group.sum()))
+        for key, group in historical.groupby(level=[0, 1], sort=False)
+    }
+    return {
+        key: (Counter(group["_segment"]), len(group), *historical_mix[key])
+        for key, group in titles.groupby([name_column, "Subcanal2"], sort=False)
+        if key in historical_mix and historical_mix[key][1] > 0
+    }
+
+
+def _prioritize_eg_gr_titles(
+    df: pd.DataFrame,
+    strategy_targets: pd.Series,
+    city_strategy_targets: pd.Series | None = None,
+    lima_quotas: dict[str, int] | None = None,
+) -> None:
+    """Make quota-neutral swaps while keeping each changed share within ±1 pp."""
+    selection = config.SELECTION_COL
+    titles = df[selection].eq("T")
+    priority = df["_segment"].isin(["EG", "GR"])
+    incoming = df[selection].eq("NO") & priority & ~df["_mandatory"]
+    outgoing = titles & ~priority & ~df["_mandatory"]
+    if not incoming.any() or not outgoing.any() or strategy_targets.empty:
+        return
+
+    scopes = {"NOMBRE": _title_mix_state(df.loc[titles], "NOMBRE", strategy_targets)}
+    grouping = [*CITY_GROUP, "RUT.COM", "_is_specialized"]
+    if city_strategy_targets is not None:
+        grouping.append("CDA_ORIG_CITY")
+        scopes["CDA_ORIG_CITY"] = _title_mix_state(
+            df.loc[titles], "CDA_ORIG_CITY", city_strategy_targets,
+        )
+    if lima_quotas:
+        # Keep each protected Lima minimum exactly where it was allocated.
+        protected = _lima_source_mask(df) & df["LOC.COM"].isin(lima_quotas)
+        grouping.append(df["LOC.COM"].where(protected).rename("_protected_lima_location"))
+
+    def stays_in_band(segment, delta, states):
+        for current, total, historical, historical_total in states:
+            # Compare shares by cross multiplication. Small groups can have
+            # no integer count inside the literal band, so do not round it out.
+            after = current[segment] + delta
+            difference = abs(after * historical_total - historical.get(segment, 0) * total)
+            if 100 * difference > total * historical_total:
+                return False
+        return True
+
+    for _, group in df.loc[incoming | outgoing].groupby(grouping, sort=False, dropna=False):
+        is_title = group[selection].eq("T")
+        if not is_title.any() or is_title.all():
+            continue
+        first = group.iloc[0]
+        states = [mix.get((first[column], first["Subcanal2"])) for column, mix in scopes.items()]
+        if any(state is None for state in states):
+            continue
+
+        # Retain the normal rank among interchangeable candidates. Try the
+        # lowest-ranked removable title first, with no changes to mandatory points.
+        donors = defaultdict(deque)
+        ranked_donors = _rank(group.loc[is_title])["_segment"].iloc[::-1]
+        for order, (index, segment) in enumerate(ranked_donors.items()):
+            donors[segment].append((order, index))
+        blocked_segments = set()
+        for index, segment in _rank(group.loc[~is_title])["_segment"].items():
+            if segment in blocked_segments:
+                continue
+            if not stays_in_band(segment, 1, states):
+                blocked_segments.add(segment)
+                continue
+            donor = min(
+                (pool[0] for category, pool in donors.items()
+                 if pool and stays_in_band(category, -1, states)),
+                default=None,
+            )
+            if donor is None:
+                break
+            _, donor_index = donor
+            donor_segment = df.at[donor_index, "_segment"]
+            donors[donor_segment].popleft()
+            df.loc[donor_index, selection] = "NO"
+            df.loc[index, selection] = "T"
+            for current, *_ in states:
+                current[donor_segment] -= 1
+                current[segment] += 1
+
+
 def _assign_substitutes(df: pd.DataFrame) -> None:
     """Assign continuous S1→S3 levels independently inside every title route.
 
@@ -1709,8 +1809,8 @@ def _assign_substitutes(df: pd.DataFrame) -> None:
     grouping = [city_column, "RUT.COM", "_sub_specialization"]
     for _key, candidates in df.loc[candidate_mask].groupby(grouping, dropna=False, sort=True):
         ordered = candidates.sort_values(
-            by=["_sub_priority", "_mandatory", "_prev_t", "Ventas", "CODIGO"],
-            ascending=[True, False, True, False, True],
+            by=["Ventas", "_sub_priority", "_mandatory", "_prev_t", "CODIGO"],
+            ascending=[False, True, False, True, True],
             kind="stable",
         )
         count = len(ordered)
@@ -1846,13 +1946,17 @@ def _select_with_cda_quotas(
     )
 
     on_mask = eligible["_CDA_CHANNEL"].eq("ON")
-    selected_on = select_canal_on(eligible.loc[on_mask], effective_targets, strategy_targets)
+    selected_on = select_canal_on(
+        eligible.loc[on_mask], effective_targets, strategy_targets,
+        city_strategy_targets=historical_strategy_targets,
+    )
     on_routes = set(selected_on.loc[selected_on[config.SELECTION_COL].eq("T"), "RUT.COM"].astype(str))
     selected_off = select_canal_off(
         eligible.loc[~on_mask], effective_targets, strategy_targets, lima_quotas,
         preferred_on_routes=on_routes,
         allow_cda_exception=True,
         allow_off_route_fallback=True,
+        city_strategy_targets=historical_strategy_targets,
     )
     selected_on["_CANAL_SELECCION"] = "ON"
     selected_off["_CANAL_SELECCION"] = "OFF"

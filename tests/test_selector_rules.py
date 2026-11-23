@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -220,6 +221,55 @@ class OnRouteTargetTests(unittest.TestCase):
 
 
 class OffAndSubstituteTests(unittest.TestCase):
+    def test_eg_and_gr_have_priority_inside_the_exact_mix_band_in_both_channels(self):
+        for channel in ("ON", "OFF"):
+            with self.subTest(channel=channel):
+                rows = []
+                for route in range(4):
+                    for segment in ("EG", "GR", "ME", "PE"):
+                        for position in range(8):
+                            rows.append({
+                                "CODIGO": len(rows) + 1, "NOMBRE": "CITY", "Subcanal2": channel,
+                                "CANAL": channel, "RUT.COM": str(route), "ESTRATEGICA": segment,
+                                "Fenix": int(channel == "OFF" and segment == "ME" and position == 0),
+                                "Programa de Valor": "0", "SEL_MES_ANT": "NO", "Esparta_Flag": 0,
+                                "ESPECIALIZADA": "SI" if channel == "ON" else "NO",
+                                "Ventas": 100 - position, "LOC.COM": "",
+                            })
+                frame = pd.DataFrame(rows)
+                city = pd.Series({("CITY", channel): 100})
+                city.index = city.index.set_names(selector_engine.CITY_GROUP)
+                strategy = pd.Series({("CITY", channel, segment): 25 for segment in ("EG", "GR", "ME", "PE")})
+                select = selector_engine.select_canal_on if channel == "ON" else selector_engine.select_canal_off
+                args = () if channel == "ON" else ({},)
+                with patch.object(selector_engine, "_prioritize_eg_gr_titles"):
+                    baseline = select(frame, city, strategy, *args)
+                result = select(frame, city, strategy, *args)
+                titles = result.loc[result[config.SELECTION_COL].eq("T")]
+                self.assertEqual(titles["ESTRATEGICA"].value_counts().to_dict(), {
+                    "EG": 26, "GR": 26, "ME": 24, "PE": 24,
+                })
+                by_route = ["RUT.COM", "ESPECIALIZADA", config.SELECTION_COL]
+                pd.testing.assert_series_equal(result.groupby(by_route).size(), baseline.groupby(by_route).size())
+                self.assertTrue(result.loc[result["Fenix"].gt(0), config.SELECTION_COL].eq("T").all())
+
+    def test_cda_priority_also_respects_the_original_city_mix(self):
+        frame = pd.DataFrame([{
+            "CODIGO": index, "NOMBRE": "CDA", "CDA_ORIG_CITY": "CITY", "Subcanal2": "ON",
+            "RUT.COM": "R1", "_segment": "GR" if index <= 50 else "ME",
+            "_is_specialized": True, "_is_titan": False, "_mandatory": False,
+            "Esparta_Flag": 0, "_prev_t": False, "Ventas": 100 - index,
+            config.SELECTION_COL: "NO" if index == 0 else "T",
+        } for index in range(101)])
+        cda_strategy = pd.Series({("CDA", "ON", "GR"): 50, ("CDA", "ON", "ME"): 50})
+        city_strategy = pd.Series({("CITY", "ON", "GR"): 49, ("CITY", "ON", "ME"): 51})
+        selector_engine._prioritize_eg_gr_titles(frame, cda_strategy, city_strategy)
+        self.assertEqual(frame.at[0, config.SELECTION_COL], "NO")
+        city_strategy = pd.Series({("CITY", "ON", "GR"): 50, ("CITY", "ON", "ME"): 50})
+        selector_engine._prioritize_eg_gr_titles(frame, cda_strategy, city_strategy)
+        self.assertEqual(frame.at[0, config.SELECTION_COL], "T")
+        self.assertEqual(int(frame[config.SELECTION_COL].eq("T").sum()), 100)
+
     def test_off_route_is_qualified_by_route_even_when_nombre_is_zero(self):
         frame = pd.DataFrame([
             {
@@ -241,19 +291,18 @@ class OffAndSubstituteTests(unittest.TestCase):
         prepared = selector_engine._prepare(frame)
         self.assertEqual(prepared["_off_qualified_route"].tolist(), [True, True, False])
 
-    def test_substitutes_use_only_three_levels(self):
+    def test_substitutes_keep_level_sizes_and_order_by_sales_before_strategy(self):
         frame = pd.DataFrame([
             {
                 "CODIGO": code, "NOMBRE": "LIMA", "RUT.COM": "R1", "Ventas": 100 - code,
                 config.SELECTION_COL: "T" if code == 1 else "NO", "_is_specialized": True,
-                "Esparta_Flag": 0, "_segment": "GR", "_mandatory": code == 1, "_prev_t": False,
+                "Esparta_Flag": 0, "_segment": "ME" if code > 9 else "GR",
+                "_mandatory": code == 1, "_prev_t": code < 6,
             }
             for code in range(1, 14)
         ])
         selector_engine._assign_substitutes(frame)
-        levels = set(frame[config.SELECTION_COL])
-        self.assertNotIn("S4", levels)
-        self.assertTrue({"S1", "S2", "S3"}.issubset(levels))
+        self.assertEqual(frame[config.SELECTION_COL].tolist(), ["T"] + ["S1"] * 4 + ["S2"] * 4 + ["S3"] * 4)
 
 
 if __name__ == "__main__":
